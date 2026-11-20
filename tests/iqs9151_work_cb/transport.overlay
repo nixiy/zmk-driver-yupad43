@@ -36,5 +36,10 @@
             reg = <0x58>;
             irq-gpios = <&test_rdy 1 GPIO_ACTIVE_LOW>;
         };
+        test_wrong_part: touchpad@59 {
+            compatible = "azoteq,iqs9151";
+            reg = <0x59>;
+            irq-gpios = <&test_rdy 2 GPIO_ACTIVE_LOW>;
+        };
     };
 };

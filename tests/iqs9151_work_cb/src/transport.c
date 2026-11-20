@@ -24,14 +24,40 @@ struct sensor {
     atomic_t nack_frames;
     atomic_t nack_mapping;
     atomic_t pin_reset_after_restore;
+    atomic_t id_reads;
+    atomic_t writes;
+    atomic_t lose_release;
 };
 
 static atomic_t x_reports;
 static atomic_t system_queue_io;
+static atomic_t left_down;
+static atomic_t left_ups;
+static atomic_t move_while_held;
+#define RETOUCH_REL_X 77
+
+static void reopen_window(struct k_timer *timer) {
+    struct sensor *s = k_timer_user_data_get(timer);
+    gpio_emul_input_set(s->ready.port, s->ready.pin, 0);
+}
+K_TIMER_DEFINE(next_id_window, reopen_window, NULL);
 
 int input_report(const struct device *dev, uint8_t type, uint16_t code,
                  int32_t value, bool sync, k_timeout_t timeout) {
-    if (type == INPUT_EV_REL && code == INPUT_REL_X && value == 12) {
+    if (dev == DEVICE_DT_GET(DT_NODELABEL(test_other_pad))) {
+        if (type == INPUT_EV_KEY && code == INPUT_BTN_0) {
+            atomic_set(&left_down, value);
+            if (value == 0) {
+                atomic_inc(&left_ups);
+            }
+        }
+        if (type == INPUT_EV_REL && code == INPUT_REL_X &&
+            value == RETOUCH_REL_X && atomic_get(&left_down)) {
+            atomic_inc(&move_while_held);
+        }
+    }
+    if (dev == DEVICE_DT_GET(DT_NODELABEL(test_pad)) &&
+        type == INPUT_EV_REL && code == INPUT_REL_X && value == 12) {
         atomic_inc(&x_reports);
     }
     return 0;
@@ -45,6 +71,17 @@ static void signal_window(struct sensor *s) {
     atomic_set(&s->signalled, 1);
     gpio_emul_input_set(s->ready.port, s->ready.pin, 1);
     gpio_emul_input_set(s->ready.port, s->ready.pin, 0);
+}
+
+static void set_touch(struct sensor *s, bool down, uint16_t x, uint16_t dx) {
+    uint16_t flags = down ? IQS9151_TP_FINGER1_CONFIDENCE | 1 : 0;
+    if (dx) {
+        flags |= IQS9151_TP_MOVEMENT_DETECTED;
+    }
+    sys_put_le16(flags, at(s, IQS9151_ADDR_TRACKPAD_FLAGS));
+    sys_put_le16(x, at(s, IQS9151_ADDR_FINGER1_X));
+    sys_put_le16(200, at(s, IQS9151_ADDR_FINGER1_Y));
+    sys_put_le16(dx, at(s, IQS9151_ADDR_RELATIVE_X));
 }
 
 static void power_on_sensor(struct sensor *s) {
@@ -67,6 +104,22 @@ static int sensor_transfer(const struct emul *emul, struct i2c_msg *msgs, int co
         return -EINVAL;
     }
     if (count == 2) {
+        if (reg == IQS9151_ADDR_PRODUCT_NUMBER) {
+            int previous = atomic_inc(&s->id_reads);
+            if (addr == 0x59) {
+                sys_put_le16(0xabcd, msgs[1].buf);
+                return 0;
+            }
+            if (addr == 0x58 && previous == 0) {
+                gpio_emul_input_set(s->ready.port, s->ready.pin, 1);
+                k_timer_user_data_set(&next_id_window, s);
+                k_timer_start(&next_id_window, K_MSEC(75), K_NO_WAIT);
+                return -EIO;
+            }
+            if (addr == 0x58 && gpio_pin_get_dt(&s->ready) == 0) {
+                return -EIO;
+            }
+        }
         if (reg == IQS9151_ADDR_RELATIVE_X) {
             atomic_inc(&s->frame_reads);
             if (!atomic_get(&s->signalled)) {
@@ -76,6 +129,14 @@ static int sensor_transfer(const struct emul *emul, struct i2c_msg *msgs, int co
                 atomic_dec(&s->nack_frames);
                 return -EIO; /* RDY stays asserted until the host services it. */
             }
+            if (atomic_cas(&s->lose_release, 1, 0)) {
+                /* Window expires; a different finger arrives while the old
+                 * I2C call is still blocked. The worker will see RDY active. */
+                k_msleep(100);
+                set_touch(s, true, 720, RETOUCH_REL_X);
+                signal_window(s);
+                return -EIO;
+            }
             if (!(sys_get_le16(at(s, IQS9151_ADDR_INFO_FLAGS)) & IQS9151_INFO_SHOW_RESET)) {
                 gpio_emul_input_set(s->ready.port, s->ready.pin, 1);
             }
@@ -83,6 +144,7 @@ static int sensor_transfer(const struct emul *emul, struct i2c_msg *msgs, int co
         memcpy(msgs[1].buf, at(s, reg), len);
         return 0;
     }
+    atomic_inc(&s->writes);
     if (reg == IQS9151_ADDR_RX_TX_MAPPING && atomic_cas(&s->nack_mapping, 1, 0)) {
         return -EIO;
     }
@@ -119,12 +181,57 @@ static int sensor_init(const struct emul *emul, const struct device *bus) {
     EMUL_DT_INST_DEFINE(n, sensor_init, &sensor_##n, NULL, &api, NULL);
 DT_INST_FOREACH_STATUS_OKAY(IQS_EMUL)
 
-static void wait_for_count(atomic_t *counter, int expected, int timeout_ms) {
+static void wait_for_count_at(atomic_t *counter, int expected, int timeout_ms, int line) {
     int64_t deadline = k_uptime_get() + timeout_ms;
     while (atomic_get(counter) < expected && k_uptime_get() < deadline) {
         k_msleep(1);
     }
-    zassert_equal(atomic_get(counter), expected);
+    zassert_equal(atomic_get(counter), expected, "line %d: expected %d, got %ld",
+                  line, expected, (long)atomic_get(counter));
+}
+#define wait_for_count(counter, expected, timeout_ms) \
+    wait_for_count_at(counter, expected, timeout_ms, __LINE__)
+
+ZTEST(iqs9151_transport, test_id_retry_waits_for_window_and_rejects_wrong_part) {
+    struct sensor *good = EMUL_DT_GET(DT_NODELABEL(test_other_pad))->data;
+    struct sensor *wrong = EMUL_DT_GET(DT_NODELABEL(test_wrong_part))->data;
+    zassert_true(device_is_ready(DEVICE_DT_GET(DT_NODELABEL(test_other_pad))));
+    zassert_equal(atomic_get(&good->id_reads), 2);
+    zassert_false(device_is_ready(DEVICE_DT_GET(DT_NODELABEL(test_wrong_part))));
+    zassert_equal(atomic_get(&wrong->id_reads), 1);
+    zassert_equal(atomic_get(&wrong->writes), 0);
+}
+
+static void send_touch(struct sensor *s, bool down, uint16_t x, uint16_t dx) {
+    int frames = atomic_get(&s->frame_reads);
+    set_touch(s, down, x, dx);
+    signal_window(s);
+    wait_for_count(&s->frame_reads, frames + 1, 100);
+}
+
+ZTEST(iqs9151_transport, test_drag_continuity_depends_on_retry_window) {
+    struct sensor *s = EMUL_DT_GET(DT_NODELABEL(test_other_pad))->data;
+    send_touch(s, true, 300, 0);
+    send_touch(s, false, 0, 0);
+    wait_for_count(&left_down, 1, 100);
+    k_msleep(30);
+    send_touch(s, true, 300, 0);
+    send_touch(s, true, 400, 5);
+    int frames = atomic_get(&s->frame_reads);
+    atomic_set(&s->nack_frames, 1);
+    signal_window(s);
+    wait_for_count(&s->frame_reads, frames + 2, 100);
+    k_msleep(300);
+    zassert_equal(atomic_get(&left_ups), 0, "same-window retry interrupted a static drag");
+
+    set_touch(s, false, 0, 0);
+    atomic_set(&s->lose_release, 1);
+    signal_window(s);
+    wait_for_count(&left_ups, 1, 350);
+    send_touch(s, true, 800, RETOUCH_REL_X);
+    zassert_equal(atomic_get(&move_while_held), 0, "new contact inherited the drag");
+    send_touch(s, false, 0, 0);
+    zassert_equal(atomic_get(&left_down), 0, "ambiguous contact created a tap");
 }
 
 ZTEST(iqs9151_transport, test_irq_error_and_already_asserted_pin) {

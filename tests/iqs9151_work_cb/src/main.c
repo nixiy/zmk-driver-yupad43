@@ -1972,6 +1972,56 @@ ZTEST_F(iqs9151_work_cb, test_two_finger_staggered_lift_obeys_total_tap_deadline
     zassert_equal(fixture->log.count, 0U);
 }
 
+static void start_three_finger_tap(struct iqs9151_work_cb_fixture *fixture) {
+    const uint16_t flags = IQS9151_TP_FINGER1_CONFIDENCE | IQS9151_TP_FINGER2_CONFIDENCE |
+                           IQS9151_TP_FINGER3_CONFIDENCE | 3U;
+    const struct iqs9151_test_frame down = make_frame(3, flags, 0, 0, 0, 300, 410, 700, 530);
+    iqs9151_test_process_frame(fixture->ctx, &down, 0);
+}
+
+ZTEST_F(iqs9151_work_cb, test_three_finger_first_lift_checks_surviving_slot1) {
+    start_three_finger_tap(fixture);
+    send_contact_positions(fixture, 40, 420, 410, 700, 530);
+    send_contact_positions(fixture, 60, 420, 410, UINT16_MAX, UINT16_MAX);
+    send_contact_positions(fixture, 90, UINT16_MAX, UINT16_MAX, UINT16_MAX, UINT16_MAX);
+    zassert_equal(fixture->log.count, 0U);
+}
+
+ZTEST_F(iqs9151_work_cb, test_three_finger_last_slot2_motion_cancels_tap) {
+    start_three_finger_tap(fixture);
+    send_contact_positions(fixture, 40, 300, 410, 700, 530);
+    send_contact_positions(fixture, 60, UINT16_MAX, UINT16_MAX, 700, 530);
+    send_contact_positions(fixture, 70, UINT16_MAX, UINT16_MAX, 700, 650);
+    send_contact_positions(fixture, 90, UINT16_MAX, UINT16_MAX, UINT16_MAX, UINT16_MAX);
+    zassert_equal(fixture->log.count, 0U);
+}
+
+ZTEST_F(iqs9151_work_cb, test_three_finger_last_slot3_accumulates_relative_motion) {
+    start_three_finger_tap(fixture);
+    const uint16_t flags = IQS9151_TP_FINGER3_CONFIDENCE | IQS9151_TP_MOVEMENT_DETECTED | 1U;
+    const struct iqs9151_test_frame step =
+        make_frame(1, flags, 0, CONFIG_INPUT_IQS9151_3F_TAP_MOVE, 0,
+                   UINT16_MAX, UINT16_MAX, UINT16_MAX, UINT16_MAX);
+    iqs9151_test_process_frame(fixture->ctx, &step, 50);
+    iqs9151_test_process_frame(fixture->ctx, &step, 65);
+    send_contact_positions(fixture, 90, UINT16_MAX, UINT16_MAX, UINT16_MAX, UINT16_MAX);
+    for (size_t i = 0; i < fixture->log.count; i++) {
+        zassert_not_equal(fixture->log.events[i].type, IQS9151_TEST_EVENT_KEY);
+    }
+}
+
+ZTEST_F(iqs9151_work_cb, test_three_finger_last_slot3_ignores_stale_relative_motion) {
+    start_three_finger_tap(fixture);
+    const struct iqs9151_test_frame still =
+        make_frame(1, IQS9151_TP_FINGER3_CONFIDENCE | 1U, 120, 0, 0,
+                   UINT16_MAX, UINT16_MAX, UINT16_MAX, UINT16_MAX);
+    iqs9151_test_process_frame(fixture->ctx, &still, 50);
+    send_contact_positions(fixture, 90, UINT16_MAX, UINT16_MAX, UINT16_MAX, UINT16_MAX);
+    zassert_equal(fixture->log.count, 1U);
+    zassert_equal(fixture->log.events[0].code, INPUT_BTN_2);
+    zassert_equal(fixture->log.events[0].value, 1);
+}
+
 ZTEST_F(iqs9151_work_cb, test_three_finger_tap_distinguishes_second_finger_motion) {
     const uint16_t flags = 3 | IQS9151_TP_FINGER1_CONFIDENCE | IQS9151_TP_FINGER2_CONFIDENCE;
     struct iqs9151_test_frame triple = make_frame(3, flags, 0, 0, 0, 100, 100, 200, 100);
