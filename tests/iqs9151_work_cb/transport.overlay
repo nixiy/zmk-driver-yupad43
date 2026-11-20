@@ -1,0 +1,40 @@
+#include <zephyr/dt-bindings/gpio/gpio.h>
+
+/ {
+    test_rdy: gpio@200 {
+        compatible = "zephyr,gpio-emul";
+        reg = <0x200 0x10>;
+        gpio-controller;
+        #gpio-cells = <2>;
+        falling-edge;
+    };
+    test_no_edge: gpio@220 {
+        compatible = "zephyr,gpio-emul";
+        reg = <0x220 0x10>;
+        gpio-controller;
+        #gpio-cells = <2>;
+        rising-edge;
+    };
+    test_bus: i2c@240 {
+        compatible = "zephyr,i2c-emul-controller";
+        reg = <0x240 0x10>;
+        clock-frequency = <400000>;
+        #address-cells = <1>;
+        #size-cells = <0>;
+        test_pad: touchpad@56 {
+            compatible = "azoteq,iqs9151";
+            reg = <0x56>;
+            irq-gpios = <&test_rdy 0 GPIO_ACTIVE_LOW>;
+        };
+        test_bad_irq: touchpad@57 {
+            compatible = "azoteq,iqs9151";
+            reg = <0x57>;
+            irq-gpios = <&test_no_edge 0 GPIO_ACTIVE_LOW>;
+        };
+        test_other_pad: touchpad@58 {
+            compatible = "azoteq,iqs9151";
+            reg = <0x58>;
+            irq-gpios = <&test_rdy 1 GPIO_ACTIVE_LOW>;
+        };
+    };
+};

@@ -19,15 +19,33 @@ struct iqs9151_work_cb_fixture {
     struct event_log log;
 };
 
+/* Fault injection at the real input_report() return boundary. */
+static struct {
+    struct event_log *log;
+    uint16_t button;
+    int fail_ups;
+    int fail_downs;
+} input_queue;
+
+static void record_event(const struct iqs9151_test_event *event, void *user_data);
+
 int input_report(const struct device *dev,
                  uint8_t type, uint16_t code, int32_t value, bool sync,
                  k_timeout_t timeout) {
-    ARG_UNUSED(dev);
-    ARG_UNUSED(type);
-    ARG_UNUSED(code);
-    ARG_UNUSED(value);
-    ARG_UNUSED(sync);
-    ARG_UNUSED(timeout);
+    if (input_queue.log != NULL) {
+        if (type == INPUT_EV_KEY && code == input_queue.button) {
+            int *failures = value ? &input_queue.fail_downs : &input_queue.fail_ups;
+            if (*failures > 0) {
+                (*failures)--;
+                return -ENOMSG;
+            }
+        }
+        const struct iqs9151_test_event event = {
+            .type = type == INPUT_EV_KEY ? IQS9151_TEST_EVENT_KEY : IQS9151_TEST_EVENT_REL,
+            .dev = dev, .code = code, .value = value, .sync = sync, .timeout = timeout,
+        };
+        record_event(&event, input_queue.log);
+    }
     return 0;
 }
 
@@ -78,11 +96,225 @@ static void iqs9151_work_cb_before(void *fixture_ptr) {
     struct iqs9151_work_cb_fixture *fixture =
         (struct iqs9151_work_cb_fixture *)fixture_ptr;
 
+    memset(&input_queue, 0, sizeof(input_queue));
     memset(&fixture->log, 0, sizeof(fixture->log));
     iqs9151_test_cancel_pending_work(fixture->ctx);
     iqs9151_test_context_init(fixture->ctx, NULL);
     iqs9151_test_set_event_hook(record_event, &fixture->log);
 }
+
+static void scroll_pair_at(struct iqs9151_work_cb_fixture *fixture, int64_t ms, uint16_t y) {
+    const uint16_t flags = IQS9151_TP_FINGER1_CONFIDENCE | IQS9151_TP_FINGER2_CONFIDENCE | 2U;
+    const struct iqs9151_test_frame frame = make_frame(2, flags, 0, 0, 0, 100, y, 250, y);
+    iqs9151_test_process_frame(fixture->ctx, &frame, ms);
+}
+
+ZTEST_F(iqs9151_work_cb, test_scroll_speed_uses_elapsed_time_and_includes_stationary_reports) {
+    int32_t vx, vy;
+    int64_t last_motion_ms;
+    scroll_pair_at(fixture, 0, 100);
+    scroll_pair_at(fixture, 20, 160);
+    zassert_true(iqs9151_test_scroll_seed(fixture->ctx, 20, &vx, &vy, &last_motion_ms));
+    zassert_equal(vy, 30 * 256, "60 counts / 20 ms is 30 counts per tick");
+    scroll_pair_at(fixture, 27, 181);
+    zassert_true(iqs9151_test_scroll_seed(fixture->ctx, 27, &vx, &vy, &last_motion_ms));
+    zassert_equal(vy, 30 * 256, "Same speed across uneven sample intervals");
+    scroll_pair_at(fixture, 40, 181);
+    zassert_true(iqs9151_test_scroll_seed(fixture->ctx, 40, &vx, &vy, &last_motion_ms));
+    zassert_equal(vy, 81 * 10 * 256 / 40, "Stationary intervals reduce the launch speed");
+    zassert_equal(last_motion_ms, 27);
+    zassert_false(iqs9151_test_scroll_seed(fixture->ctx, 63, &vx, &vy, &last_motion_ms));
+}
+
+ZTEST_F(iqs9151_work_cb, test_scroll_glide_uses_elapsed_time_without_a_catchup_burst) {
+    const struct iqs9151_test_frame up = {0};
+    scroll_pair_at(fixture, 0, 100);
+    scroll_pair_at(fixture, 10, 200);
+    iqs9151_test_process_frame(fixture->ctx, &up, 11);
+    zassert_true(iqs9151_test_scroll_inertia_active(fixture->ctx));
+
+    zassert_equal(iqs9151_test_scroll_wheel_at(fixture->ctx, 9), 0);
+    zassert_equal(iqs9151_test_scroll_wheel_at(fixture->ctx, 11), 30);
+    zassert_equal(iqs9151_test_scroll_wheel_at(fixture->ctx, 19), 0);
+    zassert_equal(iqs9151_test_scroll_wheel_at(fixture->ctx, 20), 28);
+    const int32_t late = iqs9151_test_scroll_wheel_at(fixture->ctx, 100);
+    zassert_true(late > 0 && late < 2 * 28, "Catch-up burst: %d", late);
+    zassert_equal(iqs9151_test_scroll_wheel_at(fixture->ctx, 3100), 0);
+    zassert_false(iqs9151_test_scroll_inertia_active(fixture->ctx));
+}
+
+ZTEST_F(iqs9151_work_cb, test_scroll_reversal_uses_only_the_new_direction) {
+    int32_t vx, vy;
+    int64_t last_motion_ms;
+    scroll_pair_at(fixture, 0, 100);
+    scroll_pair_at(fixture, 10, 180);
+    scroll_pair_at(fixture, 20, 178);
+    zassert_false(iqs9151_test_scroll_seed(fixture->ctx, 20, &vx, &vy, &last_motion_ms));
+    scroll_pair_at(fixture, 30, 166);
+    zassert_true(iqs9151_test_scroll_seed(fixture->ctx, 30, &vx, &vy, &last_motion_ms));
+    zassert_equal(vx, 0);
+    zassert_equal(vy, -7 * 256);
+    zassert_equal(last_motion_ms, 30);
+}
+
+ZTEST_F(iqs9151_work_cb, test_scroll_speed_does_not_bridge_a_missing_slot_or_stale_pair) {
+    const struct iqs9151_test_frame missing =
+        make_frame(2, IQS9151_TP_FINGER1_CONFIDENCE | 2, 0, 0, 0, 100, 170, UINT16_MAX, UINT16_MAX);
+    int32_t vx, vy;
+    int64_t last_motion_ms;
+    scroll_pair_at(fixture, 0, 100);
+    scroll_pair_at(fixture, 10, 160);
+    iqs9151_test_process_frame(fixture->ctx, &missing, 20);
+    scroll_pair_at(fixture, 30, 260);
+    zassert_false(iqs9151_test_scroll_seed(fixture->ctx, 30, &vx, &vy, &last_motion_ms));
+    scroll_pair_at(fixture, 40, 265);
+    zassert_true(iqs9151_test_scroll_seed(fixture->ctx, 40, &vx, &vy, &last_motion_ms));
+    zassert_equal(vy, 5 * 256);
+    scroll_pair_at(fixture, 100, 425);
+    zassert_false(iqs9151_test_scroll_seed(fixture->ctx, 100, &vx, &vy, &last_motion_ms));
+}
+
+ZTEST_F(iqs9151_work_cb, test_pinch_with_anchored_finger_wins_over_midpoint_motion) {
+    const struct iqs9151_test_frame up = {0};
+    const uint16_t flags = IQS9151_TP_FINGER1_CONFIDENCE | IQS9151_TP_FINGER2_CONFIDENCE | 2U;
+    const struct iqs9151_test_frame down = make_frame(2, flags, 0, 0, 0, 400, 300, 400, 600);
+    for (int direction = -1; direction <= 1; direction += 2) {
+        const struct iqs9151_test_frame move =
+            make_frame(2, flags, 0, 0, 0, 400, 300, 400, 600 + direction * 120);
+        const int64_t start = direction < 0 ? 0 : 500;
+        fixture->log.count = 0;
+        iqs9151_test_process_frame(fixture->ctx, &down, start);
+        iqs9151_test_process_frame(fixture->ctx, &move, start + 10);
+        iqs9151_test_process_frame(fixture->ctx, &up, start + 20);
+        zassert_equal(fixture->log.count, 3U);
+        zassert_equal(fixture->log.events[0].code, INPUT_BTN_7);
+        zassert_equal(fixture->log.events[0].value, 1);
+        zassert_equal(fixture->log.events[1].code, INPUT_REL_WHEEL);
+        zassert_true(fixture->log.events[1].value * direction > 0);
+        zassert_equal(fixture->log.events[2].code, INPUT_BTN_7);
+        zassert_equal(fixture->log.events[2].value, 0);
+    }
+}
+
+ZTEST_F(iqs9151_work_cb, test_parallel_swipe_with_unequal_travel_scrolls) {
+    const uint16_t flags = IQS9151_TP_FINGER1_CONFIDENCE | IQS9151_TP_FINGER2_CONFIDENCE | 2U;
+    const struct iqs9151_test_frame down = make_frame(2, flags, 0, 0, 0, 400, 300, 400, 600);
+    const struct iqs9151_test_frame move = make_frame(2, flags, 0, 0, 0, 400, 370, 400, 780);
+    iqs9151_test_process_frame(fixture->ctx, &down, 0);
+    iqs9151_test_process_frame(fixture->ctx, &move, 10);
+    zassert_equal(fixture->log.count, 1U);
+    zassert_equal(fixture->log.events[0].code, INPUT_REL_WHEEL);
+    zassert_equal(fixture->log.events[0].value, 125);
+}
+
+ZTEST_F(iqs9151_work_cb, test_rotation_preserves_pinch_distance_and_radial_motion_zooms) {
+    const uint16_t flags = IQS9151_TP_FINGER1_CONFIDENCE | IQS9151_TP_FINGER2_CONFIDENCE | 2U;
+    const struct iqs9151_test_frame down = make_frame(2, flags, 0, 0, 0, 250, 500, 750, 500);
+    /* Each finger remains 250 counts from the midpoint after rotation. */
+    const struct iqs9151_test_frame rotated = make_frame(2, flags, 0, 0, 0, 350, 300, 650, 700);
+    const struct iqs9151_test_frame spread = make_frame(2, flags, 0, 0, 0, 260, 180, 740, 820);
+    const struct iqs9151_test_frame up = {0};
+
+    iqs9151_test_process_frame(fixture->ctx, &down, 0);
+    iqs9151_test_process_frame(fixture->ctx, &rotated, 10);
+    zassert_equal(fixture->log.count, 0U, "Rotation alone must not trigger pinch");
+    iqs9151_test_process_frame(fixture->ctx, &spread, 20);
+    iqs9151_test_process_frame(fixture->ctx, &up, 30);
+    zassert_equal(fixture->log.count, 3U);
+    zassert_equal(fixture->log.events[0].code, INPUT_BTN_7);
+    zassert_equal(fixture->log.events[0].value, 1);
+    zassert_equal(fixture->log.events[1].code, INPUT_REL_WHEEL);
+    zassert_equal(fixture->log.events[1].value,
+                  300 * CONFIG_INPUT_IQS9151_2F_PINCH_WHEEL_GAIN_X10 / (12 * 10));
+    zassert_equal(fixture->log.events[2].code, INPUT_BTN_7);
+    zassert_equal(fixture->log.events[2].value, 0);
+}
+
+#ifdef YUPAD43_TEST_CUSTOM_CONFIG
+/* Custom gesture configuration tests. */
+ZTEST_F(iqs9151_work_cb, test_vertical_scroll_starts_only_on_vertical_travel) {
+    const uint16_t flags = IQS9151_TP_FINGER1_CONFIDENCE | IQS9151_TP_FINGER2_CONFIDENCE | 2;
+    const struct iqs9151_test_frame down = make_frame(2, flags, 0, 0, 0, 100, 100, 250, 100);
+    const struct iqs9151_test_frame horizontal = make_frame(2, flags, 0, 0, 0, 180, 100, 330, 100);
+    const struct iqs9151_test_frame nudge = make_frame(2, flags, 0, 0, 0, 180, 105, 330, 105);
+    const struct iqs9151_test_frame vertical = make_frame(2, flags, 0, 0, 0, 180, 165, 330, 165);
+
+    iqs9151_test_process_frame(fixture->ctx, &down, 0);
+    iqs9151_test_process_frame(fixture->ctx, &horizontal, 10);
+    iqs9151_test_process_frame(fixture->ctx, &nudge, 20);
+    zassert_equal(fixture->log.count, 0U, "Disabled X must not arm scrolling on a 5-count Y nudge");
+    iqs9151_test_process_frame(fixture->ctx, &vertical, 30);
+    zassert_equal(fixture->log.count, 1U);
+    zassert_equal(fixture->log.events[0].code, INPUT_REL_WHEEL);
+    zassert_equal(fixture->log.events[0].value, 60);
+}
+
+ZTEST_F(iqs9151_work_cb, test_disabled_scroll_axis_leaves_pinch_available) {
+    const uint16_t flags = IQS9151_TP_FINGER1_CONFIDENCE | IQS9151_TP_FINGER2_CONFIDENCE | 2;
+    const struct iqs9151_test_frame down = make_frame(2, flags, 0, 0, 0, 100, 100, 250, 100);
+    const struct iqs9151_test_frame horizontal = make_frame(2, flags, 0, 0, 0, 180, 100, 330, 100);
+    const struct iqs9151_test_frame spread = make_frame(2, flags, 0, 0, 0, 120, 100, 390, 100);
+    const struct iqs9151_test_frame up = {0};
+
+    iqs9151_test_process_frame(fixture->ctx, &down, 0);
+    iqs9151_test_process_frame(fixture->ctx, &horizontal, 10);
+    iqs9151_test_process_frame(fixture->ctx, &spread, 20);
+    iqs9151_test_process_frame(fixture->ctx, &up, 30);
+    zassert_equal(fixture->log.count, 3U, "Expected pinch press, wheel, release");
+    zassert_equal(fixture->log.events[0].code, INPUT_BTN_7);
+    zassert_equal(fixture->log.events[0].value, 1);
+    zassert_equal(fixture->log.events[1].code, INPUT_REL_WHEEL);
+    zassert_equal(fixture->log.events[2].code, INPUT_BTN_7);
+    zassert_equal(fixture->log.events[2].value, 0);
+}
+
+ZTEST_F(iqs9151_work_cb, test_zero_swipe_threshold_suppresses_three_finger_swipes) {
+    const uint16_t flags = IQS9151_TP_FINGER1_CONFIDENCE | 3;
+    const struct iqs9151_test_frame down = make_frame(3, flags, 0, 0, 0, 200, 200, 0, 0);
+    const struct iqs9151_test_frame move = make_frame(3, flags, 0, 0, 0, 600, 200, 0, 0);
+
+    iqs9151_test_process_frame(fixture->ctx, &down, 0);
+    zassert_equal(fixture->log.count, 0U, "Stationary contacts must not emit a swipe");
+    iqs9151_test_process_frame(fixture->ctx, &move, 10);
+    zassert_equal(fixture->log.count, 0U, "Threshold zero disables the swipe even when moving");
+}
+
+
+ZTEST_F(iqs9151_work_cb, test_taps_disabled_leave_motion_and_scroll_active) {
+    const struct iqs9151_test_frame one =
+        make_frame(1, IQS9151_TP_FINGER1_CONFIDENCE | 1, 0, 0, 0, 100, 100, UINT16_MAX, UINT16_MAX);
+    const struct iqs9151_test_frame move =
+        make_frame(1, IQS9151_TP_FINGER1_CONFIDENCE | IQS9151_TP_MOVEMENT_DETECTED | 1,
+                   4, -3, 0, 104, 97, UINT16_MAX, UINT16_MAX);
+    const uint16_t pair_flags = IQS9151_TP_FINGER1_CONFIDENCE | IQS9151_TP_FINGER2_CONFIDENCE | 2;
+    const struct iqs9151_test_frame two = make_frame(2, pair_flags, 0, 0, 0, 100, 100, 200, 100);
+    const struct iqs9151_test_frame scroll = make_frame(2, pair_flags, 0, 0, 0, 100, 160, 200, 160);
+    const struct iqs9151_test_frame up = {0};
+
+    iqs9151_test_process_frame(fixture->ctx, &one, 1);
+    iqs9151_test_process_frame(fixture->ctx, &up, 21);
+    zassert_equal(fixture->log.count, 0, "TAP=n must not press a button even with PRESSHOLD=y");
+    zassert_equal(iqs9151_test_hold_button(fixture->ctx), 0);
+    iqs9151_test_process_frame(fixture->ctx, &one, 50);
+    iqs9151_test_process_frame(fixture->ctx, &move, 60);
+    iqs9151_test_process_frame(fixture->ctx, &up, 80);
+    zassert_equal(fixture->log.count, 2);
+    zassert_equal(fixture->log.events[0].code, INPUT_REL_X);
+    zassert_equal(fixture->log.events[0].value, 4);
+    zassert_equal(fixture->log.events[1].code, INPUT_REL_Y);
+    zassert_equal(fixture->log.events[1].value, -3);
+
+    iqs9151_test_process_frame(fixture->ctx, &two, 110);
+    iqs9151_test_process_frame(fixture->ctx, &up, 140);
+    zassert_equal(fixture->log.count, 2, "2F tap must not press BTN1 either");
+    iqs9151_test_process_frame(fixture->ctx, &two, 170);
+    iqs9151_test_process_frame(fixture->ctx, &scroll, 180);
+    zassert_equal(fixture->log.count, 3);
+    zassert_equal(fixture->log.events[2].code, INPUT_REL_WHEEL);
+    zassert_equal(fixture->log.events[2].value, 60);
+}
+
+#else
 
 ZTEST_F(iqs9151_work_cb, test_show_reset_releases_pinch_and_clears_state) {
     const struct iqs9151_test_frame show_reset_frame =
@@ -475,6 +707,8 @@ ZTEST_F(iqs9151_work_cb, test_two_finger_tap_one_lead_finger_emits_btn1) {
 
     iqs9151_test_process_frame(fixture->ctx, &one_lead, k_uptime_get());
     iqs9151_test_process_frame(fixture->ctx, &two_start, k_uptime_get());
+    k_msleep(10);
+    iqs9151_test_process_frame(fixture->ctx, &two_start, k_uptime_get());
     iqs9151_test_process_frame(fixture->ctx, &one_release, k_uptime_get());
     iqs9151_test_process_frame(fixture->ctx, &release, k_uptime_get());
 
@@ -511,6 +745,8 @@ ZTEST_F(iqs9151_work_cb, test_two_finger_tap_moved_one_lead_does_not_click) {
 
     iqs9151_test_process_frame(fixture->ctx, &one_lead, k_uptime_get());
     iqs9151_test_process_frame(fixture->ctx, &one_lead_move, k_uptime_get());
+    iqs9151_test_process_frame(fixture->ctx, &two_start, k_uptime_get());
+    k_msleep(10);
     iqs9151_test_process_frame(fixture->ctx, &two_start, k_uptime_get());
     iqs9151_test_process_frame(fixture->ctx, &one_release, k_uptime_get());
     iqs9151_test_process_frame(fixture->ctx, &release, k_uptime_get());
@@ -777,6 +1013,8 @@ ZTEST_F(iqs9151_work_cb, test_two_finger_double_tap_one_lead_second_touch_emits_
                   "BTN1 should stay pressed during second-touch one-lead");
 
     k_msleep(12);
+    iqs9151_test_process_frame(fixture->ctx, &second_tap_down, k_uptime_get());
+    k_msleep(10);
     iqs9151_test_process_frame(fixture->ctx, &second_tap_down, k_uptime_get());
     iqs9151_test_process_frame(fixture->ctx, &second_tap_up, k_uptime_get());
 
@@ -1440,5 +1678,310 @@ ZTEST_F(iqs9151_work_cb, test_ati_warning_keeps_cursor_and_release_working) {
     zassert_equal(iqs9151_test_prev_finger_count(fixture->ctx), 0U);
     zassert_equal(iqs9151_test_hold_button(fixture->ctx), 0U);
 }
+
+/* Reproduce the frame order seen during one physical finger on the XIAO.
+ * Only one scan contained a confident pair, for 12 ms. */
+ZTEST_F(iqs9151_work_cb, test_isolated_second_contact_keeps_single_tap) {
+    const struct iqs9151_test_frame one =
+        make_frame(1, IQS9151_TP_FINGER1_CONFIDENCE | 1, 0, 0, 0, 100, 100, UINT16_MAX, UINT16_MAX);
+    const struct iqs9151_test_frame pair =
+        make_frame(2, IQS9151_TP_FINGER1_CONFIDENCE | IQS9151_TP_FINGER2_CONFIDENCE | 2,
+                   0, 0, 0, 100, 100, 190, 120);
+    const struct iqs9151_test_frame up = {0};
+
+    iqs9151_test_process_frame(fixture->ctx, &one, 0);
+    iqs9151_test_process_frame(fixture->ctx, &one, 45);
+    iqs9151_test_process_frame(fixture->ctx, &pair, 58);
+    iqs9151_test_process_frame(fixture->ctx, &one, 70);
+    iqs9151_test_process_frame(fixture->ctx, &up, 80);
+    zassert_equal(fixture->log.count, 1U);
+    zassert_equal(fixture->log.events[0].code, INPUT_BTN_0);
+    zassert_equal(fixture->log.events[0].value, 1);
+}
+
+ZTEST_F(iqs9151_work_cb, test_invalid_second_slot_drops_stale_motion_and_breaks_confirmation) {
+    const uint16_t flags = IQS9151_TP_FINGER1_CONFIDENCE | IQS9151_TP_FINGER2_CONFIDENCE | 2;
+    const struct iqs9151_test_frame one =
+        make_frame(1, IQS9151_TP_FINGER1_CONFIDENCE | 1, 0, 0, 0, 100, 100, 0, 0);
+    const struct iqs9151_test_frame pair = make_frame(2, flags, 0, 0, 0, 100, 100, 220, 100);
+    const struct iqs9151_test_frame incomplete =
+        make_frame(2, flags | IQS9151_TP_MOVEMENT_DETECTED, 9, -4, 0, 109, 96, UINT16_MAX, 100);
+    const struct iqs9151_test_frame up = {0};
+
+    iqs9151_test_process_frame(fixture->ctx, &one, 0);
+    iqs9151_test_process_frame(fixture->ctx, &pair, 10);
+    iqs9151_test_process_frame(fixture->ctx, &incomplete, 20);
+    iqs9151_test_process_frame(fixture->ctx, &pair, 30);
+    zassert_equal(fixture->log.count, 0U, "A raw two-contact report has no usable relative XY");
+    const struct iqs9151_test_frame motion =
+        make_frame(1, IQS9151_TP_FINGER1_CONFIDENCE | IQS9151_TP_MOVEMENT_DETECTED | 1,
+                   3, -2, 0, 112, 94, UINT16_MAX, UINT16_MAX);
+    iqs9151_test_process_frame(fixture->ctx, &motion, 40);
+    iqs9151_test_process_frame(fixture->ctx, &up, 45);
+    zassert_equal(fixture->log.count, 3U);
+    zassert_equal(fixture->log.events[0].code, INPUT_REL_X);
+    zassert_equal(fixture->log.events[0].value, 3);
+    zassert_equal(fixture->log.events[1].code, INPUT_REL_Y);
+    zassert_equal(fixture->log.events[1].value, -2);
+    zassert_equal(fixture->log.events[2].code, INPUT_BTN_0);
+}
+
+ZTEST_F(iqs9151_work_cb, test_confirmed_second_contact_preserves_initial_scroll_delta) {
+    const uint16_t flags = IQS9151_TP_FINGER1_CONFIDENCE | IQS9151_TP_FINGER2_CONFIDENCE | 2;
+    const struct iqs9151_test_frame one =
+        make_frame(1, IQS9151_TP_FINGER1_CONFIDENCE | 1, 0, 0, 0, 100, 100, 0, 0);
+    const struct iqs9151_test_frame pair = make_frame(2, flags, 0, 0, 0, 100, 100, 220, 100);
+    const struct iqs9151_test_frame moved = make_frame(2, flags, 0, 0, 0, 100, 180, 220, 180);
+
+    iqs9151_test_process_frame(fixture->ctx, &one, 0);
+    iqs9151_test_process_frame(fixture->ctx, &pair, 10);
+    iqs9151_test_process_frame(fixture->ctx, &moved, 20);
+    zassert_equal(fixture->log.count, 1U);
+    zassert_equal(fixture->log.events[0].code, INPUT_REL_WHEEL);
+    zassert_equal(fixture->log.events[0].value, 80);
+}
+
+ZTEST_F(iqs9151_work_cb, test_buffered_second_contact_keeps_original_down_time) {
+    const uint16_t flags = IQS9151_TP_FINGER1_CONFIDENCE | IQS9151_TP_FINGER2_CONFIDENCE | 2;
+    const struct iqs9151_test_frame one =
+        make_frame(1, IQS9151_TP_FINGER1_CONFIDENCE | 1, 0, 0, 0, 100, 100, 0, 0);
+    const struct iqs9151_test_frame pair = make_frame(2, flags, 0, 0, 0, 100, 100, 220, 100);
+    const struct iqs9151_test_frame up = {0};
+
+    iqs9151_test_process_frame(fixture->ctx, &one, 0);
+    iqs9151_test_process_frame(fixture->ctx, &pair, 10);
+    iqs9151_test_process_frame(fixture->ctx, &pair, 250);
+    iqs9151_test_process_frame(fixture->ctx, &up, 260);
+    zassert_equal(fixture->log.count, 0U);
+}
+
+/* The IQS keeps contact identities in their absolute-coordinate slots when
+ * the other finger lifts. UINT16_MAX represents an unoccupied slot. */
+static void send_contact_positions(struct iqs9151_work_cb_fixture *fixture, int64_t ms,
+                                   uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2) {
+    const bool first = x1 != UINT16_MAX;
+    const bool second = x2 != UINT16_MAX;
+    const uint8_t count = (uint8_t)first + (uint8_t)second;
+    uint16_t flags = count;
+    if (first) {
+        flags |= IQS9151_TP_FINGER1_CONFIDENCE;
+    }
+    if (second) {
+        flags |= IQS9151_TP_FINGER2_CONFIDENCE;
+    }
+    const struct iqs9151_test_frame frame = make_frame(count, flags, 0, 0, 0, x1, y1, x2, y2);
+    iqs9151_test_process_frame(fixture->ctx, &frame, ms);
+}
+
+ZTEST_F(iqs9151_work_cb, test_staged_contact_excursion_counts_from_single_finger_down) {
+    /* XIAO recorded a right click at device ms 278001; physical finger count
+     * for this capture is unknown. F1's Y moved from 1143 to 1118 on pair
+     * entry and then to 1069. F2 stayed fixed. Scale the captured positions
+     * to the suite's 30-count tolerance (the recorded firmware used 50). */
+    send_contact_positions(fixture, 0, 25, 686, UINT16_MAX, UINT16_MAX);
+    send_contact_positions(fixture, 6, 30, 671, 762, 697);
+    send_contact_positions(fixture, 12, 33, 661, 762, 697);
+    send_contact_positions(fixture, 38, 40, 641, 762, 697);
+    send_contact_positions(fixture, 95, 31, 667, 762, 697);
+    send_contact_positions(fixture, 101, UINT16_MAX, UINT16_MAX, 762, 697);
+    send_contact_positions(fixture, 107, UINT16_MAX, UINT16_MAX, UINT16_MAX, UINT16_MAX);
+    zassert_equal(fixture->log.count, 0U, "The first finger moved beyond the tap tolerance");
+}
+
+ZTEST_F(iqs9151_work_cb, test_staged_stable_contacts_allow_right_tap_with_slot2_tail) {
+    send_contact_positions(fixture, 0, 25, 686, UINT16_MAX, UINT16_MAX);
+    send_contact_positions(fixture, 10, 30, 671, 762, 697);
+    send_contact_positions(fixture, 20, 32, 669, 763, 698);
+    send_contact_positions(fixture, 40, UINT16_MAX, UINT16_MAX, 761, 697);
+    send_contact_positions(fixture, 50, UINT16_MAX, UINT16_MAX, UINT16_MAX, UINT16_MAX);
+    zassert_equal(fixture->log.count, 1U);
+    zassert_equal(fixture->log.events[0].code, INPUT_BTN_1);
+    zassert_equal(fixture->log.events[0].value, 1);
+}
+
+ZTEST_F(iqs9151_work_cb, test_pair_returns_to_origin_after_individual_excursion) {
+    /* Total Manhattan separation stays at 80, and the centroid moves by 16.
+     * Slot 2 moves 36 counts out and then returns to its starting position. */
+    send_contact_positions(fixture, 0, 100, 100, 180, 100);
+    send_contact_positions(fixture, 10, 120, 104, 160, 64);
+    send_contact_positions(fixture, 20, 100, 100, 180, 100);
+    send_contact_positions(fixture, 30, UINT16_MAX, UINT16_MAX, UINT16_MAX, UINT16_MAX);
+    zassert_equal(fixture->log.count, 0U, "Returning to the origin must not rearm a tap");
+}
+
+ZTEST_F(iqs9151_work_cb, test_staggered_release_checks_surviving_slot1_on_first_tail_frame) {
+    send_contact_positions(fixture, 0, 100, 100, 180, 100);
+    send_contact_positions(fixture, 10, 140, 100, UINT16_MAX, UINT16_MAX);
+    send_contact_positions(fixture, 20, UINT16_MAX, UINT16_MAX, UINT16_MAX, UINT16_MAX);
+    zassert_equal(fixture->log.count, 0U);
+}
+
+ZTEST_F(iqs9151_work_cb, test_staggered_release_checks_slot2_while_release_pending) {
+    send_contact_positions(fixture, 0, 100, 100, 180, 100);
+    send_contact_positions(fixture, 10, UINT16_MAX, UINT16_MAX, 180, 100);
+    send_contact_positions(fixture, 20, UINT16_MAX, UINT16_MAX, 180, 140);
+    send_contact_positions(fixture, 30, UINT16_MAX, UINT16_MAX, 180, 100);
+    send_contact_positions(fixture, 40, UINT16_MAX, UINT16_MAX, UINT16_MAX, UINT16_MAX);
+    zassert_equal(fixture->log.count, 0U);
+}
+
+
+static void scroll_down_before_release(struct iqs9151_work_cb_fixture *fixture) {
+    send_contact_positions(fixture, 0, 100, 100, 200, 100);
+    send_contact_positions(fixture, 10, 100, 165, 200, 165);
+    send_contact_positions(fixture, 20, 100, 200, 200, 200);
+}
+
+ZTEST_F(iqs9151_work_cb, test_scroll_fling_waits_for_all_fingers) {
+    scroll_down_before_release(fixture);
+    send_contact_positions(fixture, 30, 100, 200, UINT16_MAX, UINT16_MAX);
+    zassert_false(iqs9151_test_scroll_inertia_active(fixture->ctx),
+                  "Momentum must wait while one finger remains on the pad");
+    send_contact_positions(fixture, 55, UINT16_MAX, UINT16_MAX, UINT16_MAX, UINT16_MAX);
+    zassert_true(iqs9151_test_scroll_inertia_active(fixture->ctx),
+                 "An all-up at the stale-gap boundary must preserve the flick");
+    zassert_equal(iqs9151_test_hold_button(fixture->ctx), 0U);
+}
+
+ZTEST_F(iqs9151_work_cb, test_scroll_fling_expires_from_last_motion) {
+    scroll_down_before_release(fixture);
+    send_contact_positions(fixture, 45, UINT16_MAX, UINT16_MAX, 200, 200);
+    send_contact_positions(fixture, 56, UINT16_MAX, UINT16_MAX, UINT16_MAX, UINT16_MAX);
+    zassert_false(iqs9151_test_scroll_inertia_active(fixture->ctx),
+                  "The last moving sample was 36 ms ago even though the first lift was recent");
+}
+
+ZTEST_F(iqs9151_work_cb, test_returning_contact_discards_pending_fling) {
+    scroll_down_before_release(fixture);
+    send_contact_positions(fixture, 30, 100, 200, UINT16_MAX, UINT16_MAX);
+    send_contact_positions(fixture, 35, 100, 200, 200, 200);
+    /* One pair frame is withheld by the second-contact filter. It still
+     * interrupts the lift, even if the next report is already all-up. */
+    send_contact_positions(fixture, 40, UINT16_MAX, UINT16_MAX, UINT16_MAX, UINT16_MAX);
+    zassert_false(iqs9151_test_scroll_inertia_active(fixture->ctx));
+    zassert_equal(iqs9151_test_hold_button(fixture->ctx), 0U);
+}
+
+ZTEST_F(iqs9151_work_cb, test_scroll_brake_touch_does_not_also_click) {
+    const struct iqs9151_test_frame up = {0};
+    for (uint8_t fingers = 1U; fingers <= 2U; fingers++) {
+        iqs9151_work_cb_before(fixture);
+        scroll_down_before_release(fixture);
+        iqs9151_test_process_frame(fixture->ctx, &up, 30);
+        zassert_true(iqs9151_test_scroll_inertia_active(fixture->ctx));
+        size_t before = fixture->log.count;
+        uint16_t x2 = (fingers == 2U) ? 200U : UINT16_MAX;
+        uint16_t y2 = (fingers == 2U) ? 200U : UINT16_MAX;
+        send_contact_positions(fixture, 60, 100, 200, x2, y2);
+        zassert_false(iqs9151_test_scroll_inertia_active(fixture->ctx));
+        iqs9151_test_process_frame(fixture->ctx, &up, 80);
+        zassert_equal(fixture->log.count, before, "A stationary brake touch must not click");
+        send_contact_positions(fixture, 260, 100, 200, x2, y2);
+        iqs9151_test_process_frame(fixture->ctx, &up, 285);
+        zassert_equal(fixture->log.count, before + 1U, "The next independent tap must work");
+        zassert_equal(fixture->log.events[before].code, fingers == 1U ? INPUT_BTN_0 : INPUT_BTN_1);
+    }
+}
+
+static void inject_queue_failures(struct iqs9151_work_cb_fixture *fixture, uint16_t button,
+                                  int fail_ups, int fail_downs) {
+    input_queue.log = &fixture->log;
+    input_queue.button = button;
+    input_queue.fail_ups = fail_ups;
+    input_queue.fail_downs = fail_downs;
+    iqs9151_test_set_event_hook(NULL, NULL);
+}
+
+ZTEST_F(iqs9151_work_cb, test_button_up_retries_without_more_sensor_interrupts) {
+    inject_queue_failures(fixture, INPUT_BTN_0, 2, 0);
+    send_contact_positions(fixture, 0, 100, 100, UINT16_MAX, UINT16_MAX);
+    send_contact_positions(fixture, 40, UINT16_MAX, UINT16_MAX, UINT16_MAX, UINT16_MAX);
+    zassert_equal(fixture->log.count, 1U);
+    k_msleep(CONFIG_INPUT_IQS9151_1F_TAPDRAG_GAP_MAX_MS + 60);
+    zassert_equal(fixture->log.count, 2U);
+    zassert_equal(fixture->log.events[0].value, 1);
+    zassert_equal(fixture->log.events[1].value, 0);
+    zassert_equal(input_queue.fail_ups, 0);
+}
+
+ZTEST_F(iqs9151_work_cb, test_pending_release_precedes_repress_of_same_button) {
+    const struct iqs9151_test_frame reset = {.info_flags = IQS9151_INFO_SHOW_RESET};
+    inject_queue_failures(fixture, INPUT_BTN_0, 1, 0);
+    send_contact_positions(fixture, 0, 100, 100, UINT16_MAX, UINT16_MAX);
+    send_contact_positions(fixture, 20, UINT16_MAX, UINT16_MAX, UINT16_MAX, UINT16_MAX);
+    iqs9151_test_process_frame(fixture->ctx, &reset, 40);
+    zassert_equal(fixture->log.count, 1U);
+    send_contact_positions(fixture, 60, 100, 100, UINT16_MAX, UINT16_MAX);
+    send_contact_positions(fixture, 80, UINT16_MAX, UINT16_MAX, UINT16_MAX, UINT16_MAX);
+    k_msleep(35);
+    zassert_equal(fixture->log.count, 3U);
+    zassert_equal(fixture->log.events[0].value, 1);
+    zassert_equal(fixture->log.events[1].value, 0);
+    zassert_equal(fixture->log.events[2].value, 1);
+    k_msleep(CONFIG_INPUT_IQS9151_1F_TAPDRAG_GAP_MAX_MS + 10);
+    zassert_equal(fixture->log.count, 4U);
+    zassert_equal(fixture->log.events[3].value, 0);
+}
+
+ZTEST_F(iqs9151_work_cb, test_pinch_edges_order_wheel_and_retry_modifier_release) {
+    inject_queue_failures(fixture, INPUT_BTN_7, 2, 1);
+    send_contact_positions(fixture, 0, 100, 100, 200, 100);
+    send_contact_positions(fixture, 10, 50, 100, 250, 100);
+    zassert_equal(fixture->log.count, 0U, "A pinch wheel needs a confirmed modifier press");
+    send_contact_positions(fixture, 20, 40, 100, 260, 100);
+    zassert_equal(fixture->log.count, 2U);
+    zassert_equal(fixture->log.events[0].code, INPUT_BTN_7);
+    zassert_equal(fixture->log.events[0].value, 1);
+    zassert_equal(fixture->log.events[1].code, INPUT_REL_WHEEL);
+    send_contact_positions(fixture, 30, UINT16_MAX, UINT16_MAX, UINT16_MAX, UINT16_MAX);
+    send_contact_positions(fixture, 40, 100, 100, 200, 100);
+    send_contact_positions(fixture, 50, 100, 170, 200, 170);
+    zassert_equal(fixture->log.count, 2U, "Do not zoom while trying to scroll");
+    k_msleep(35);
+    zassert_equal(fixture->log.count, 3U);
+    zassert_equal(fixture->log.events[2].code, INPUT_BTN_7);
+    zassert_equal(fixture->log.events[2].value, 0);
+    send_contact_positions(fixture, 60, 100, 200, 200, 200);
+    zassert_equal(fixture->log.events[3].code, INPUT_REL_WHEEL);
+}
+
+ZTEST_F(iqs9151_work_cb, test_any_new_raw_touch_stops_cursor_glide) {
+    const uint16_t flags = 1 | IQS9151_TP_FINGER1_CONFIDENCE | IQS9151_TP_MOVEMENT_DETECTED;
+    const struct iqs9151_test_frame moving = make_frame(1, flags, 24, 0, 0, 100, 100, 0, 0);
+    const struct iqs9151_test_frame up = {0};
+    for (uint8_t fingers = 1; fingers <= 3; fingers++) {
+        iqs9151_test_cancel_pending_work(fixture->ctx);
+        iqs9151_test_context_init(fixture->ctx, NULL);
+        iqs9151_test_process_frame(fixture->ctx, &moving, 0);
+        iqs9151_test_process_frame(fixture->ctx, &moving, 10);
+        iqs9151_test_process_frame(fixture->ctx, &up, 20);
+        zassert_true(iqs9151_test_cursor_inertia_active(fixture->ctx));
+        /* Deliberately missing XY on a two-finger wakeup. */
+        const struct iqs9151_test_frame still = make_frame(
+            fingers, fingers, 0, 0, 0, UINT16_MAX, UINT16_MAX, UINT16_MAX, UINT16_MAX);
+        iqs9151_test_process_frame(fixture->ctx, &still, 30);
+        zassert_false(iqs9151_test_cursor_inertia_active(fixture->ctx), "Finger count %u", fingers);
+    }
+}
+
+ZTEST_F(iqs9151_work_cb, test_two_finger_staggered_lift_obeys_total_tap_deadline) {
+    const int64_t limit = CONFIG_INPUT_IQS9151_2F_TAP_MAX_MS;
+    send_contact_positions(fixture, 0, 100, 100, 200, 100);
+    send_contact_positions(fixture, limit - 10, 100, 100, UINT16_MAX, UINT16_MAX);
+    send_contact_positions(fixture, limit + 1, UINT16_MAX, UINT16_MAX, UINT16_MAX, UINT16_MAX);
+    zassert_equal(fixture->log.count, 0U);
+}
+
+ZTEST_F(iqs9151_work_cb, test_three_finger_tap_distinguishes_second_finger_motion) {
+    const uint16_t flags = 3 | IQS9151_TP_FINGER1_CONFIDENCE | IQS9151_TP_FINGER2_CONFIDENCE;
+    struct iqs9151_test_frame triple = make_frame(3, flags, 0, 0, 0, 100, 100, 200, 100);
+    iqs9151_test_process_frame(fixture->ctx, &triple, 0);
+    triple.finger2_x += CONFIG_INPUT_IQS9151_3F_TAP_MOVE + 1;
+    iqs9151_test_process_frame(fixture->ctx, &triple, 50);
+    send_contact_positions(fixture, 80, UINT16_MAX, UINT16_MAX, UINT16_MAX, UINT16_MAX);
+    zassert_equal(fixture->log.count, 0U);
+}
+
+#endif
 
 ZTEST_SUITE(iqs9151_work_cb, NULL, iqs9151_work_cb_setup, iqs9151_work_cb_before, NULL, NULL);

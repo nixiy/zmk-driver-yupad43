@@ -121,6 +121,7 @@ config INPUT_IQS9151_1F_PRESSHOLD_ENABLE
     default y
     help
       Enable single-finger deferred-click/drag behavior in the driver.
+      Requires 1F_TAP_ENABLE. Disabling 1F taps also disables tap-drag.
       Behavior: first tap presses BTN0 immediately and keeps it pressed
       while waiting for a second touch.
 
@@ -195,13 +196,15 @@ config INPUT_IQS9151_2F_TAP_MOVE
     range 1 1000
     default 50
     help
-      Maximum centroid/distance movement for 2F tap detection (driver-side).
+      Maximum movement of each contact, their centroid, or their separation
+      while a two-finger tap is in progress, in output coordinate counts.
 
 config INPUT_IQS9151_2F_PRESSHOLD_ENABLE
     bool "IQS9151 two-finger press/hold enable"
     default y
     help
       Enable two-finger deferred-click/drag behavior in the driver.
+      Requires 2F_TAP_ENABLE. Disabling 2F taps also disables tap-drag.
       Behavior: first 2F tap presses BTN1 immediately and keeps it pressed
       while waiting for a second 2F touch.
 
@@ -230,7 +233,8 @@ config INPUT_IQS9151_2F_SCROLL_START_MOVE
     range 1 2000
     default 50
     help
-      Movement threshold to start 2F scroll mode (driver-side).
+      Movement of the two-finger centroid required to start scrolling.
+      Only enabled scroll axes count toward this threshold.
 
 config INPUT_IQS9151_SCROLL_INERTIA_ENABLE
     bool "IQS9151 scroll inertia enable"
@@ -241,9 +245,18 @@ config INPUT_IQS9151_SCROLL_INERTIA_ENABLE
 config INPUT_IQS9151_SCROLL_INERTIA_DECAY
     int "IQS9151 scroll inertia decay"
     range 0 1000
-    default 980
+    default 940
     help
-      Scroll inertia decay (driver-side).
+      Fraction of the remaining scroll speed retained every 10 ms, in
+      thousandths. Higher values give a longer glide after a flick.
+
+config INPUT_IQS9151_SCROLL_INERTIA_LAUNCH_GAIN_PERCENT
+    int "Scroll release speed (% of recent finger speed)"
+    range 1 100
+    default 30
+    help
+      Scale the initial speed of the glide after both fingers lift.
+      Scroll speed while fingers are touching is controlled separately.
 
 config INPUT_IQS9151_SCROLL_INERTIA_RECENT_WINDOW_MS
     int "IQS9151 scroll inertia recent window (ms)"
@@ -258,8 +271,9 @@ config INPUT_IQS9151_SCROLL_INERTIA_STALE_GAP_MS
     range 1 500
     default 35
     help
-      Maximum allowed time from the last two-finger scroll sample to
-      release for scroll inertia to start.
+      Maximum time from the last two-finger movement to lifting both
+      fingers. A gap longer than this between two reports also clears
+      the velocity estimate.
 
 config INPUT_IQS9151_SCROLL_INERTIA_MIN_SAMPLES
     int "IQS9151 scroll inertia minimum recent samples"
@@ -274,8 +288,8 @@ config INPUT_IQS9151_SCROLL_INERTIA_MIN_AVG_SPEED
     range 1 500
     default 4
     help
-      Minimum average recent two-finger scroll speed required to start
-      scroll inertia.
+      Minimum recent scroll speed in coordinate counts per 10 ms,
+      summed over the enabled axes before applying the launch gain.
 
 config INPUT_IQS9151_2F_PINCH_ENABLE
     bool "IQS9151 two-finger pinch enable"
@@ -288,7 +302,8 @@ config INPUT_IQS9151_2F_PINCH_START_DISTANCE
     range 1 2000
     default 100
     help
-      Distance-delta threshold to start 2F pinch mode (driver-side).
+      Start a pinch once the change in fingertip separation reaches this
+      threshold and exceeds the distance travelled by their midpoint.
 
 config INPUT_IQS9151_2F_PINCH_WHEEL_GAIN_X10
     int "IQS9151 two-finger pinch wheel gain (x10)"
@@ -316,13 +331,14 @@ config INPUT_IQS9151_3F_TAP_MOVE
     range 1 1000
     default 35
     help
-      Maximum finger1 tracked movement for 3F tap detection (driver-side).
+      Maximum tracked movement of either reported fingertip during a 3F tap.
 
 config INPUT_IQS9151_3F_PRESSHOLD_ENABLE
     bool "IQS9151 three-finger press/hold enable"
     default y
     help
       Enable three-finger deferred-click/drag behavior in the driver.
+      Requires 3F_TAP_ENABLE. Disabling 3F taps also disables tap-drag.
       Behavior: first 3F tap presses BTN2 immediately and keeps it pressed
       while waiting for a second 3F touch.
 
@@ -339,7 +355,8 @@ config INPUT_IQS9151_3F_SWIPE_THRESHOLD
     range 0 1000
     default 200
     help
-      Three-finger swipe threshold (driver-side).
+      Three-finger swipe threshold in output coordinate counts.
+      Set to 0 to disable three-finger swipes.
 
 config INPUT_IQS9151_TEST
     bool "IQS9151 test hooks"

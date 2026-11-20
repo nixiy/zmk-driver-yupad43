@@ -8,7 +8,7 @@ A ZMK module for the IQS9151-based yuPad43 touchpad (10 RX × 9 TX), targeting Z
 
 ## Operation
 
-Use one finger to move the pointer and two fingers to scroll vertically or horizontally. The example uses **scroll level 0 (standard)**, with pointer and scroll inertia disabled.
+With the XIAO configuration, use one finger to move the pointer and two fingers to scroll in either direction. A quick two-finger flick keeps the page moving briefly after you lift your fingers. Touch the pad again to stop it. The example uses **scroll level 0 (standard)**.
 
 The electrode configuration is specific to yuPad43. The calibration target is 400, touch and release thresholds are 30 and 26, and Finger Split Factor is 0. Operation has been checked with a 1 mm PLA cover and a XIAO nRF52840 connected over USB.
 

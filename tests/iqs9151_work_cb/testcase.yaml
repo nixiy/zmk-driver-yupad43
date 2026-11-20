@@ -1,9 +1,14 @@
+common:
+  tags:
+    - iqs9151
+    - input
+  platform_allow:
+    - qemu_cortex_m3
+    - native_sim
+    - native_sim_64
 tests:
-  iqs9151.work_cb:
-    tags:
-      - iqs9151
-      - input
-    platform_allow:
-      - qemu_cortex_m3
-      - native_sim
-      - native_sim_64
+  iqs9151.work_cb: {}
+  iqs9151.transport:
+    extra_args: YUPAD43_TEST_TRANSPORT=ON
+  iqs9151.work_cb.custom_config:
+    extra_args: YUPAD43_TEST_CUSTOM_CONFIG=ON
