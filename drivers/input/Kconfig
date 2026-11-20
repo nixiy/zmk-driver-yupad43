@@ -48,7 +48,7 @@ endchoice
 config INPUT_IQS9151_RESOLUTION_X
     int "IQS9151 X resolution"
     range 0 4095
-    default 2457
+    default 1300
     help
       X Resolution (0x11E6).
       Limited to 0-4095 to match the practical 12-bit trackpad
@@ -57,7 +57,7 @@ config INPUT_IQS9151_RESOLUTION_X
 config INPUT_IQS9151_RESOLUTION_Y
     int "IQS9151 Y resolution"
     range 0 4095
-    default 3072
+    default 1192
     help
       Y Resolution (0x11E8).
       Limited to 0-4095 to match the practical 12-bit trackpad
@@ -135,7 +135,7 @@ config INPUT_IQS9151_1F_TAPDRAG_GAP_MAX_MS
 
 config INPUT_IQS9151_CURSOR_INERTIA_ENABLE
     bool "IQS9151 cursor inertia enable"
-    default y
+    default n
     help
       Enable cursor inertia (driver-side).
 
@@ -293,7 +293,7 @@ config INPUT_IQS9151_SCROLL_INERTIA_MIN_AVG_SPEED
 
 config INPUT_IQS9151_2F_PINCH_ENABLE
     bool "IQS9151 two-finger pinch enable"
-    default y
+    default n
     help
       Enable driver-side two-finger pinch detection.
 
