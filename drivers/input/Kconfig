@@ -222,11 +222,43 @@ config INPUT_IQS9151_SCROLL_Y_ENABLE
     help
       Enable driver-side vertical two-finger scroll.
 
-config INPUT_IQS9151_SCROLL_X_ENABLE
-    bool "IQS9151 horizontal scroll enable"
-    default y
+choice INPUT_IQS9151_2F_HORIZONTAL_MODE
+    prompt "IQS9151 two-finger horizontal operation"
+    default INPUT_IQS9151_2F_HORIZONTAL_SCROLL
     help
-      Enable driver-side horizontal two-finger scroll.
+      Select exactly one horizontal operation. Vertical scrolling is
+      controlled independently by SCROLL_Y_ENABLE.
+
+config INPUT_IQS9151_2F_HORIZONTAL_SCROLL
+    bool "Horizontal scrolling"
+    help
+      Emit horizontal wheel events, with scroll inertia when enabled.
+
+config INPUT_IQS9151_2F_HORIZONTAL_SWIPE
+    bool "Horizontal swipe gestures"
+    help
+      Emit dedicated left/right INPUT_EV_KEY gesture events. Assign actions
+      in the firmware's input processors; the driver does not assign actions.
+      No horizontal wheel events or horizontal inertia are emitted.
+      A gesture locks to its initial dominant axis and fires at most once
+      until all fingers lift. Vertical scrolling keeps its inertia.
+      Directions follow the rotated output coordinate system.
+
+config INPUT_IQS9151_2F_HORIZONTAL_DISABLED
+    bool "Disabled"
+    help
+      Emit neither horizontal wheel events nor two-finger horizontal swipes.
+      Vertical scrolling, taps, and pinch remain independently configurable.
+endchoice
+
+config INPUT_IQS9151_2F_HORIZONTAL_SWIPE_THRESHOLD
+    int "Two-finger horizontal swipe distance"
+    range 1 2000
+    default 200
+    help
+      Horizontal centroid travel in output coordinate counts before a swipe.
+      Applies only in 2F_HORIZONTAL_SWIPE mode. Axis locking uses
+      2F_SCROLL_START_MOVE; the gesture requires both thresholds to be reached.
 
 config INPUT_IQS9151_2F_SCROLL_START_MOVE
     int "IQS9151 two-finger scroll start threshold"
@@ -234,7 +266,8 @@ config INPUT_IQS9151_2F_SCROLL_START_MOVE
     default 50
     help
       Movement of the two-finger centroid required to start scrolling.
-      Only enabled scroll axes count toward this threshold.
+      Only enabled scroll axes count toward this threshold. With horizontal
+      swipes enabled, this also locks the initial horizontal/vertical axis.
 
 config INPUT_IQS9151_SCROLL_INERTIA_ENABLE
     bool "IQS9151 scroll inertia enable"

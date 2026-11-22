@@ -1,5 +1,6 @@
 #include <zephyr/input/input.h>
 #include <zephyr/ztest.h>
+#include <dt-bindings/input/iqs9151.h>
 
 #include "iqs9151_regs.h"
 #include "iqs9151_test.h"
@@ -1582,7 +1583,7 @@ ZTEST_F(iqs9151_work_cb, test_three_finger_tap_step_to_two_then_zero_avoids_btn1
                   "Deferred BTN2 press should be released on timeout");
 }
 
-ZTEST_F(iqs9151_work_cb, test_three_finger_swipe_right_emits_btn3_click) {
+ZTEST_F(iqs9151_work_cb, test_three_finger_swipe_right_emits_gesture) {
     const struct iqs9151_test_frame three_start =
         make_frame(3U, IQS9151_TP_FINGER1_CONFIDENCE | 3U, 0, 0, 0, 1000, 1000, 0, 0);
     const struct iqs9151_test_frame three_swipe =
@@ -1591,13 +1592,13 @@ ZTEST_F(iqs9151_work_cb, test_three_finger_swipe_right_emits_btn3_click) {
     iqs9151_test_process_frame(fixture->ctx, &three_start, k_uptime_get());
     iqs9151_test_process_frame(fixture->ctx, &three_swipe, k_uptime_get());
 
-    zassert_equal(fixture->log.count, 2U, "Expected BTN3 click (press + release)");
+    zassert_equal(fixture->log.count, 2U, "Expected right swipe press + release");
     zassert_equal(fixture->log.events[0].type, IQS9151_TEST_EVENT_KEY, "Event[0] not key");
-    zassert_equal(fixture->log.events[0].code, INPUT_BTN_3, "Event[0] unexpected code");
-    zassert_equal(fixture->log.events[0].value, 1, "Event[0] should be BTN3 press");
+    zassert_equal(fixture->log.events[0].code, IQS9151_GESTURE_3F_SWIPE_RIGHT, "Unexpected gesture");
+    zassert_equal(fixture->log.events[0].value, 1, "Expected press");
     zassert_equal(fixture->log.events[1].type, IQS9151_TEST_EVENT_KEY, "Event[1] not key");
-    zassert_equal(fixture->log.events[1].code, INPUT_BTN_3, "Event[1] unexpected code");
-    zassert_equal(fixture->log.events[1].value, 0, "Event[1] should be BTN3 release");
+    zassert_equal(fixture->log.events[1].code, IQS9151_GESTURE_3F_SWIPE_RIGHT, "Unexpected gesture");
+    zassert_equal(fixture->log.events[1].value, 0, "Expected release");
 }
 
 ZTEST_F(iqs9151_work_cb, test_three_finger_swipe_continuous_touch_emits_once) {
@@ -1619,13 +1620,13 @@ ZTEST_F(iqs9151_work_cb, test_three_finger_swipe_continuous_touch_emits_once) {
     iqs9151_test_process_frame(fixture->ctx, &release, k_uptime_get());
 
     zassert_equal(fixture->log.count, 2U,
-                  "Expected a single BTN3 click while 3 fingers stay on pad");
+                  "Expected a single right swipe while 3 fingers stay on pad");
     zassert_equal(fixture->log.events[0].type, IQS9151_TEST_EVENT_KEY, "Event[0] not key");
-    zassert_equal(fixture->log.events[0].code, INPUT_BTN_3, "Event[0] unexpected code");
-    zassert_equal(fixture->log.events[0].value, 1, "Event[0] should be BTN3 press");
+    zassert_equal(fixture->log.events[0].code, IQS9151_GESTURE_3F_SWIPE_RIGHT, "Unexpected gesture");
+    zassert_equal(fixture->log.events[0].value, 1, "Expected press");
     zassert_equal(fixture->log.events[1].type, IQS9151_TEST_EVENT_KEY, "Event[1] not key");
-    zassert_equal(fixture->log.events[1].code, INPUT_BTN_3, "Event[1] unexpected code");
-    zassert_equal(fixture->log.events[1].value, 0, "Event[1] should be BTN3 release");
+    zassert_equal(fixture->log.events[1].code, IQS9151_GESTURE_3F_SWIPE_RIGHT, "Unexpected gesture");
+    zassert_equal(fixture->log.events[1].value, 0, "Expected release");
 }
 
 ZTEST_F(iqs9151_work_cb, test_three_finger_swipe_left_continuous_touch_emits_once) {
@@ -1647,13 +1648,13 @@ ZTEST_F(iqs9151_work_cb, test_three_finger_swipe_left_continuous_touch_emits_onc
     iqs9151_test_process_frame(fixture->ctx, &release, k_uptime_get());
 
     zassert_equal(fixture->log.count, 2U,
-                  "Expected a single BTN4 click while 3 fingers stay on pad");
+                  "Expected a single left swipe while 3 fingers stay on pad");
     zassert_equal(fixture->log.events[0].type, IQS9151_TEST_EVENT_KEY, "Event[0] not key");
-    zassert_equal(fixture->log.events[0].code, INPUT_BTN_4, "Event[0] unexpected code");
-    zassert_equal(fixture->log.events[0].value, 1, "Event[0] should be BTN4 press");
+    zassert_equal(fixture->log.events[0].code, IQS9151_GESTURE_3F_SWIPE_LEFT, "Unexpected gesture");
+    zassert_equal(fixture->log.events[0].value, 1, "Expected press");
     zassert_equal(fixture->log.events[1].type, IQS9151_TEST_EVENT_KEY, "Event[1] not key");
-    zassert_equal(fixture->log.events[1].code, INPUT_BTN_4, "Event[1] unexpected code");
-    zassert_equal(fixture->log.events[1].value, 0, "Event[1] should be BTN4 release");
+    zassert_equal(fixture->log.events[1].code, IQS9151_GESTURE_3F_SWIPE_LEFT, "Unexpected gesture");
+    zassert_equal(fixture->log.events[1].value, 0, "Expected release");
 }
 
 /* A quality warning must not suppress otherwise valid cursor frames. */
@@ -1900,6 +1901,52 @@ ZTEST_F(iqs9151_work_cb, test_button_up_retries_without_more_sensor_interrupts) 
     k_msleep(CONFIG_INPUT_IQS9151_1F_TAPDRAG_GAP_MAX_MS + 60);
     zassert_equal(fixture->log.count, 2U);
     zassert_equal(fixture->log.events[0].value, 1);
+    zassert_equal(fixture->log.events[1].value, 0);
+    zassert_equal(input_queue.fail_ups, 0);
+}
+
+ZTEST_F(iqs9151_work_cb, test_three_finger_vertical_gestures_have_distinct_codes) {
+    const struct {
+        uint16_t y;
+        uint16_t code;
+    } cases[] = {
+        {600, IQS9151_GESTURE_3F_SWIPE_UP},
+        {1400, IQS9151_GESTURE_3F_SWIPE_DOWN},
+    };
+    const struct iqs9151_test_frame down =
+        make_frame(3, IQS9151_TP_FINGER1_CONFIDENCE | 3, 0, 0, 0, 1000, 1000, 0, 0);
+    const struct iqs9151_test_frame up = {0};
+    for (size_t i = 0; i < ARRAY_SIZE(cases); i++) {
+        fixture->log.count = 0;
+        const struct iqs9151_test_frame move =
+            make_frame(3, IQS9151_TP_FINGER1_CONFIDENCE | 3, 0, 0, 0,
+                       1000, cases[i].y, 0, 0);
+        iqs9151_test_process_frame(fixture->ctx, &down, i * 100);
+        iqs9151_test_process_frame(fixture->ctx, &move, i * 100 + 10);
+        iqs9151_test_process_frame(fixture->ctx, &up, i * 100 + 20);
+        zassert_equal(fixture->log.count, 2U);
+        zassert_equal(fixture->log.events[0].code, cases[i].code);
+        zassert_equal(fixture->log.events[0].value, 1);
+        zassert_equal(fixture->log.events[1].code, cases[i].code);
+        zassert_equal(fixture->log.events[1].value, 0);
+    }
+}
+
+ZTEST_F(iqs9151_work_cb, test_gesture_release_retries_for_highest_release_bit) {
+    inject_queue_failures(fixture, IQS9151_GESTURE_3F_SWIPE_DOWN, 2, 0);
+    const struct iqs9151_test_frame down =
+        make_frame(3, IQS9151_TP_FINGER1_CONFIDENCE | 3, 0, 0, 0, 1000, 1000, 0, 0);
+    const struct iqs9151_test_frame move =
+        make_frame(3, IQS9151_TP_FINGER1_CONFIDENCE | 3, 0, 0, 0, 1000, 1400, 0, 0);
+    const struct iqs9151_test_frame up = {0};
+    iqs9151_test_process_frame(fixture->ctx, &down, 0);
+    iqs9151_test_process_frame(fixture->ctx, &move, 10);
+    iqs9151_test_process_frame(fixture->ctx, &up, 20);
+    k_msleep(40);
+    zassert_equal(fixture->log.count, 2U);
+    zassert_equal(fixture->log.events[0].code, IQS9151_GESTURE_3F_SWIPE_DOWN);
+    zassert_equal(fixture->log.events[0].value, 1);
+    zassert_equal(fixture->log.events[1].code, IQS9151_GESTURE_3F_SWIPE_DOWN);
     zassert_equal(fixture->log.events[1].value, 0);
     zassert_equal(input_queue.fail_ups, 0);
 }
