@@ -54,6 +54,18 @@ Three-finger swipes now use these events instead of `INPUT_BTN_3` through
 `INPUT_BTN_6`. Tap buttons `INPUT_BTN_0` through `INPUT_BTN_2` and the pinch
 modifier `INPUT_BTN_7` are unchanged.
 
+### Stack for behavior execution
+
+`behaviors-consume` invokes behaviors, ZMK event listeners and HID transports
+synchronously on the input thread. When this processor is instantiated, the
+module defaults `CONFIG_INPUT_THREAD_STACK_SIZE` to 2048. In the affected
+nRF52840 firmware, active frames already require at least 520 bytes before
+event listeners or USB/BLE transport, exceeding the 512-byte default.
+An explicit setting below 2048 in threaded input mode is rejected at build time.
+Use a pristine build or an explicit 2048-byte `.conf` setting if an old build
+cache retains the previous 512-byte value.
+The 520-byte figure is a static lower bound, not measured peak usage on hardware.
+
 ## License
 
 Based on ShiniNet / zmk-driver-iqs9151 (MIT License), with changes to the electrode configuration, initialization settings, and ATI communication for yuPad43.

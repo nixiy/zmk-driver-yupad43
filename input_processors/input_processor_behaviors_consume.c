@@ -28,6 +28,16 @@ struct ip_behaviors_config {
     const struct zmk_behavior_binding *bindings;
 };
 
+#if DT_HAS_COMPAT_STATUS_OKAY(DT_DRV_COMPAT) && IS_ENABLED(CONFIG_INPUT_MODE_THREAD)
+/* zmk_behavior_invoke_binding() dispatches nested ZMK events and HID reports
+ * on the caller's stack. On the affected nRF52840 build, the active frames
+ * already exceed 512 bytes before reaching any event listener/transport.
+ * An explicit low .conf value overrides Kconfig defaults, so reject it here.
+ */
+BUILD_ASSERT(CONFIG_INPUT_THREAD_STACK_SIZE >= 2048,
+             "behaviors-consume requires CONFIG_INPUT_THREAD_STACK_SIZE >= 2048");
+#endif
+
 static int ip_behaviors_consume_handle_event(const struct device *dev, struct input_event *event,
                                              uint32_t param1, uint32_t param2,
                                              struct zmk_input_processor_state *state) {
