@@ -12,3 +12,9 @@ tests:
     extra_args: YUPAD43_TEST_TRANSPORT=ON
   iqs9151.work_cb.custom_config:
     extra_args: YUPAD43_TEST_CUSTOM_CONFIG=ON
+  iqs9151.work_cb.horizontal_swipe:
+    extra_args: YUPAD43_TEST_HORIZONTAL_SWIPE=ON
+  iqs9151.work_cb.horizontal_swipe_no_tapdrag:
+    extra_args:
+      - YUPAD43_TEST_HORIZONTAL_SWIPE=ON
+      - YUPAD43_TEST_NO_TAPDRAG=ON

@@ -39,3 +39,11 @@ menuconfig ZMK_INPUT_PROCESSOR_BEHAVIORS_CONSUME
       Invoke behaviors for matched events, then neutralize the event so it
       does not generate mouse button output. This avoids relying on STOP
       being honored in layer overrides.
+
+config INPUT_THREAD_STACK_SIZE
+    default 2048 if ZMK_INPUT_PROCESSOR_BEHAVIORS_CONSUME && DT_HAS_ZMK_INPUT_PROCESSOR_BEHAVIORS_CONSUME_ENABLED
+    help
+      Behavior execution runs synchronously on the input thread, including
+      ZMK event listeners and HID transport calls. The Zephyr default of
+      512 bytes is too small for this path. Reserve 2048 bytes when this
+      module's behavior processor is instantiated.

@@ -12,6 +12,7 @@
 #include <zephyr/sys/atomic.h>
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/sys/util.h>
+#include <dt-bindings/input/iqs9151.h>
 
 #include "iqs9151_init.h"
 #include "iqs9151_regs.h"
@@ -120,6 +121,7 @@ enum iqs9151_two_finger_mode {
     IQS9151_2F_MODE_NONE = 0,
     IQS9151_2F_MODE_SCROLL,
     IQS9151_2F_MODE_PINCH,
+    IQS9151_2F_MODE_HORIZONTAL_SWIPE,
 };
 struct iqs9151_one_finger_state {
     bool active;
@@ -134,6 +136,7 @@ struct iqs9151_one_finger_state {
     uint16_t last_y;
 };
 struct iqs9151_two_finger_state {
+    bool swipe_sent;
     bool active;
     bool hold_sent;
     bool tap_candidate;
@@ -225,7 +228,7 @@ struct iqs9151_data {
     uint8_t frame_retries;
     uint8_t recovery_attempts;
     struct k_work_delayable release_work;
-    uint8_t pending_releases;  /* One bit per INPUT_BTN_0 .. INPUT_BTN_7. */
+    uint16_t pending_releases; /* One bit per iqs9151_reported_key_codes entry. */
     bool pinch_button_down;
     struct k_work_delayable one_finger_click_work;
     struct k_work_delayable two_finger_click_work;
@@ -251,6 +254,7 @@ struct iqs9151_data {
     int64_t three_finger_click_pending_ms;
     bool two_finger_one_lead_valid;
     bool two_finger_tail_suppresses_cursor;
+    bool horizontal_swipe_until_lift;
     bool three_finger_one_lead_valid;
     bool three_finger_two_lead_valid;
     struct iqs9151_frame prev_frame;
@@ -914,11 +918,31 @@ static void iqs9151_inertia_cancel(struct iqs9151_inertia_state *state,
     k_work_cancel_delayable(work);
 }
 
-/* Button edges must remain ordered when the Zephyr input queue is full.
+static const uint16_t iqs9151_reported_key_codes[] = {
+    INPUT_BTN_0, INPUT_BTN_1, INPUT_BTN_2, INPUT_BTN_3,
+    INPUT_BTN_4, INPUT_BTN_5, INPUT_BTN_6, INPUT_BTN_7,
+    IQS9151_GESTURE_2F_SWIPE_LEFT, IQS9151_GESTURE_2F_SWIPE_RIGHT,
+    IQS9151_GESTURE_3F_SWIPE_LEFT, IQS9151_GESTURE_3F_SWIPE_RIGHT,
+    IQS9151_GESTURE_3F_SWIPE_UP, IQS9151_GESTURE_3F_SWIPE_DOWN,
+};
+BUILD_ASSERT(ARRAY_SIZE(iqs9151_reported_key_codes) <= 16,
+             "pending_releases must fit all reported keys");
+
+static uint16_t iqs9151_key_release_bit(uint16_t code) {
+    for (size_t i = 0; i < ARRAY_SIZE(iqs9151_reported_key_codes); i++) {
+        if (iqs9151_reported_key_codes[i] == code) {
+            return BIT(i);
+        }
+    }
+    return 0;
+}
+
+/* Key edges must remain ordered when the Zephyr input queue is full.
  * Remember an undelivered up even after the gesture that produced it ends. */
 static bool iqs9151_button_up(struct iqs9151_data *data, const struct device *dev,
                               uint16_t button, k_timeout_t timeout) {
-    const uint8_t bit = BIT(button - INPUT_BTN_0);
+    const uint16_t bit = iqs9151_key_release_bit(button);
+    __ASSERT_NO_MSG(bit != 0U);
     if (iqs9151_report_key_event(dev, button, false, true, timeout) == 0) {
         data->pending_releases &= ~bit;
         if (data->pending_releases == 0U) {
@@ -934,7 +958,7 @@ static bool iqs9151_button_up(struct iqs9151_data *data, const struct device *de
 static bool iqs9151_button_down(struct iqs9151_data *data, const struct device *dev,
                                 uint16_t button) {
     const k_timeout_t timeout = K_MSEC(IQS9151_KEY_RETRY_MS);
-    if ((data->pending_releases & BIT(button - INPUT_BTN_0)) &&
+    if ((data->pending_releases & iqs9151_key_release_bit(button)) &&
         !iqs9151_button_up(data, dev, button, timeout)) {
         return false;
     }
@@ -944,9 +968,9 @@ static bool iqs9151_button_down(struct iqs9151_data *data, const struct device *
 static void iqs9151_retry_releases(struct k_work *work) {
     struct iqs9151_data *data =
         CONTAINER_OF(k_work_delayable_from_work(work), struct iqs9151_data, release_work);
-    for (uint16_t button = INPUT_BTN_0; button <= INPUT_BTN_7; button++) {
-        if (data->pending_releases & BIT(button - INPUT_BTN_0)) {
-            (void)iqs9151_button_up(data, data->dev, button, K_NO_WAIT);
+    for (size_t i = 0; i < ARRAY_SIZE(iqs9151_reported_key_codes); i++) {
+        if (data->pending_releases & BIT(i)) {
+            (void)iqs9151_button_up(data, data->dev, iqs9151_reported_key_codes[i], K_NO_WAIT);
         }
     }
 }
@@ -1133,6 +1157,7 @@ static void iqs9151_one_finger_reset(struct iqs9151_one_finger_state *state) {
 }
 
 static void iqs9151_two_finger_reset(struct iqs9151_two_finger_state *state) {
+    state->swipe_sent = false;
     state->active = false;
     state->hold_sent = false;
     state->tap_candidate = false;
@@ -1333,6 +1358,7 @@ static void iqs9151_two_finger_update(struct iqs9151_data *data,
             (void)k_work_cancel_delayable(&data->two_finger_click_work);
         }
         state->active = true;
+        state->swipe_sent = false;
         state->hold_sent = tapdrag_second_touch;
         const bool valid_entry = prev_frame->finger_count == 1U
             ? one_lead_tap_candidate
@@ -1456,9 +1482,16 @@ static void iqs9151_two_finger_update(struct iqs9151_data *data,
             const int32_t abs_x = iqs9151_abs32(state->centroid_dx);
             const int32_t abs_y = iqs9151_abs32(state->centroid_dy);
             const int32_t abs_dist = iqs9151_abs32(state->pinch_distance_last - state->pinch_distance_start);
+            const bool horizontal_swipe =
+                IS_ENABLED(CONFIG_INPUT_IQS9151_2F_HORIZONTAL_SWIPE);
+            const bool start_swipe = horizontal_swipe &&
+                abs_x >= TWO_FINGER_SCROLL_START_MOVE && abs_x > abs_y;
             const bool start_scroll =
-                (IS_ENABLED(CONFIG_INPUT_IQS9151_SCROLL_X_ENABLE) && abs_x >= TWO_FINGER_SCROLL_START_MOVE) ||
-                (IS_ENABLED(CONFIG_INPUT_IQS9151_SCROLL_Y_ENABLE) && abs_y >= TWO_FINGER_SCROLL_START_MOVE);
+                (IS_ENABLED(CONFIG_INPUT_IQS9151_2F_HORIZONTAL_SCROLL) &&
+                 abs_x >= TWO_FINGER_SCROLL_START_MOVE) ||
+                (IS_ENABLED(CONFIG_INPUT_IQS9151_SCROLL_Y_ENABLE) &&
+                 abs_y >= TWO_FINGER_SCROLL_START_MOVE &&
+                 (!horizontal_swipe || abs_y >= abs_x));
             /* With one finger anchored, the midpoint travels half the change
              * in span. Wait for the pinch threshold when opening/closing is
              * dominant, even if the midpoint crossed the scroll threshold. */
@@ -1467,6 +1500,10 @@ static void iqs9151_two_finger_update(struct iqs9151_data *data,
             if (span_dominates && abs_dist >= TWO_FINGER_PINCH_START_DISTANCE) {
                 state->mode = IQS9151_2F_MODE_PINCH;
                 state->tap_candidate = false;
+            } else if (!span_dominates && start_swipe) {
+                state->mode = IQS9151_2F_MODE_HORIZONTAL_SWIPE;
+                state->tap_candidate = false;
+                data->horizontal_swipe_until_lift = true;
             } else if (!span_dominates && start_scroll) {
                 state->mode = IQS9151_2F_MODE_SCROLL;
                 result->scroll_started = true;
@@ -1474,9 +1511,18 @@ static void iqs9151_two_finger_update(struct iqs9151_data *data,
             }
         }
 
-        if (state->mode == IQS9151_2F_MODE_SCROLL) {
+        if (state->mode == IQS9151_2F_MODE_HORIZONTAL_SWIPE) {
+            if (!state->swipe_sent && iqs9151_finger1_valid(frame) &&
+                iqs9151_finger2_valid(frame) &&
+                iqs9151_abs32(state->centroid_dx) >=
+                    CONFIG_INPUT_IQS9151_2F_HORIZONTAL_SWIPE_THRESHOLD) {
+                const uint16_t button = state->centroid_dx < 0
+                    ? IQS9151_GESTURE_2F_SWIPE_LEFT : IQS9151_GESTURE_2F_SWIPE_RIGHT;
+                state->swipe_sent = iqs9151_click_button(data, dev, button);
+            }
+        } else if (state->mode == IQS9151_2F_MODE_SCROLL) {
             result->scroll_active = true;
-            if (IS_ENABLED(CONFIG_INPUT_IQS9151_SCROLL_X_ENABLE)) {
+            if (IS_ENABLED(CONFIG_INPUT_IQS9151_2F_HORIZONTAL_SCROLL)) {
                 result->scroll_x = (int16_t)CLAMP(step_x, INT16_MIN, INT16_MAX);
             }
             if (IS_ENABLED(CONFIG_INPUT_IQS9151_SCROLL_Y_ENABLE)) {
@@ -1770,12 +1816,14 @@ static bool iqs9151_three_finger_update(struct iqs9151_data *data,
             !data->three_swipe_sent && !data->three_hold_sent) {
             if (iqs9151_abs32(data->three_dx) >= CONFIG_INPUT_IQS9151_3F_SWIPE_THRESHOLD &&
                 iqs9151_abs32(data->three_dx) >= iqs9151_abs32(data->three_dy)) {
-                const uint16_t key = (data->three_dx < 0) ? INPUT_BTN_4 : INPUT_BTN_3;
+                const uint16_t key = (data->three_dx < 0)
+                    ? IQS9151_GESTURE_3F_SWIPE_LEFT : IQS9151_GESTURE_3F_SWIPE_RIGHT;
                 data->three_swipe_sent = iqs9151_click_button(data, dev, key);
                 return true;
             } else if (iqs9151_abs32(data->three_dy) >= CONFIG_INPUT_IQS9151_3F_SWIPE_THRESHOLD &&
                        iqs9151_abs32(data->three_dy) > iqs9151_abs32(data->three_dx)) {
-                const uint16_t key = (data->three_dy < 0) ? INPUT_BTN_5 : INPUT_BTN_6;
+                const uint16_t key = (data->three_dy < 0)
+                    ? IQS9151_GESTURE_3F_SWIPE_UP : IQS9151_GESTURE_3F_SWIPE_DOWN;
                 data->three_swipe_sent = iqs9151_click_button(data, dev, key);
                 return true;
             }
@@ -1864,6 +1912,7 @@ static void iqs9151_reset_gesture_states(struct iqs9151_data *data,
     (void)k_work_cancel_delayable(&data->three_finger_click_work);
     data->two_finger_one_lead_valid = false;
     data->two_finger_tail_suppresses_cursor = false;
+    data->horizontal_swipe_until_lift = false;
     data->scroll_release_expiry_ms = 0;
     data->scroll_braking_touch = false;
     data->three_finger_one_lead_valid = false;
@@ -2145,6 +2194,18 @@ static bool iqs9151_update_gesture_sessions(struct iqs9151_data *data,
     const struct device *dev = data->dev;
     bool released_from_hold = false;
 
+    /* Keep swipes latched across staggered lifts and contact-count noise.
+     * Do not turn the remaining finger into cursor motion, a tap or a new swipe. */
+    if (data->horizontal_swipe_until_lift) {
+        if (frame->finger_count == 0U) {
+            data->horizontal_swipe_until_lift = false;
+            iqs9151_two_finger_reset(&data->two_finger);
+        } else if (frame->finger_count == 2U) {
+            iqs9151_two_finger_update(data, frame, prev_frame, dev, two_result, now_ms);
+        }
+        return false;
+    }
+
     if (frame->finger_count > 1U && data->one_finger_click_pending) {
         if (data->hold_button == INPUT_BTN_0) {
             iqs9151_release_hold(data, dev);
@@ -2420,6 +2481,14 @@ static void iqs9151_dispatch_frame(struct iqs9151_data *data,
     suppress_cursor_tail =
         iqs9151_should_suppress_cursor_for_two_finger_tail(data, frame, &prev_frame,
                                                            &two_result);
+    if (data->horizontal_swipe_until_lift) {
+        suppress_cursor_tail = true;
+        iqs9151_inertia_cancel(&data->inertia_scroll, &data->inertia_scroll_work);
+        iqs9151_inertia_cancel(&data->inertia_cursor, &data->inertia_cursor_work);
+        iqs9151_motion_history_reset(&data->scroll_motion_history);
+        iqs9151_motion_history_reset(&data->cursor_motion_history);
+        data->scroll_release_expiry_ms = 0;
+    }
 
     if (two_result.scroll_ended && frame->finger_count == 1U) {
         data->one_finger.tap_candidate = false;
@@ -3060,6 +3129,7 @@ static int iqs9151_init(const struct device *dev) {
     iqs9151_clear_three_finger_click_pending(data);
     data->two_finger_one_lead_valid = false;
     data->two_finger_tail_suppresses_cursor = false;
+    data->horizontal_swipe_until_lift = false;
     data->scroll_release_expiry_ms = 0;
     data->scroll_braking_touch = false;
     data->three_finger_one_lead_valid = false;
@@ -3122,6 +3192,7 @@ void iqs9151_test_context_init(void *ctx, const struct device *dev) {
     iqs9151_clear_three_finger_click_pending(data);
     data->two_finger_one_lead_valid = false;
     data->two_finger_tail_suppresses_cursor = false;
+    data->horizontal_swipe_until_lift = false;
     data->scroll_release_expiry_ms = 0;
     data->scroll_braking_touch = false;
     data->three_finger_one_lead_valid = false;
