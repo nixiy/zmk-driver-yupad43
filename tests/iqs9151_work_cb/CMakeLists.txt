@@ -4,6 +4,8 @@ set(CONFIG_APPLICATION_DEFINED_SYSCALL true)
 option(YUPAD43_TEST_HORIZONTAL_SWIPE "Exercise two-finger horizontal gesture events" OFF)
 option(YUPAD43_TEST_NO_TAPDRAG "Disable tap/recontact dragging" OFF)
 option(YUPAD43_TEST_TRANSPORT "Exercise the real driver with emulated I2C and RDY" OFF)
+option(YUPAD43_TEST_RUNTIME_INERTIA "Exercise the public runtime inertia API" OFF)
+option(YUPAD43_TEST_INERTIA_INIT_OFF "Start with scroll inertia disabled" OFF)
 if(YUPAD43_TEST_TRANSPORT)
     list(APPEND DTS_ROOT ${CMAKE_CURRENT_LIST_DIR}/../..)
     set(DTC_OVERLAY_FILE ${CMAKE_CURRENT_LIST_DIR}/transport.overlay)
@@ -14,7 +16,9 @@ find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(iqs9151_work_cb_test)
 
 target_sources(app PRIVATE ../../drivers/input/iqs9151.c)
-if(YUPAD43_TEST_TRANSPORT)
+if(YUPAD43_TEST_RUNTIME_INERTIA)
+    target_sources(app PRIVATE src/runtime_inertia.c)
+elseif(YUPAD43_TEST_TRANSPORT)
     target_sources(app PRIVATE src/transport.c)
 elseif(YUPAD43_TEST_HORIZONTAL_SWIPE)
     target_sources(app PRIVATE src/horizontal_swipe.c)
@@ -88,7 +92,6 @@ target_compile_definitions(app PRIVATE
     CONFIG_INPUT_IQS9151_3F_TAPDRAG_GAP_MAX_MS=230
     CONFIG_INPUT_IQS9151_SCROLL_Y_ENABLE=1
     CONFIG_INPUT_IQS9151_CURSOR_INERTIA_ENABLE=1
-    CONFIG_INPUT_IQS9151_SCROLL_INERTIA_ENABLE=1
     CONFIG_INPUT_IQS9151_RESOLUTION_X=2457
     CONFIG_INPUT_IQS9151_RESOLUTION_Y=3072
     CONFIG_INPUT_IQS9151_ATI_TARGETCOUNT=400
@@ -97,3 +100,7 @@ target_compile_definitions(app PRIVATE
     CONFIG_INPUT_IQS9151_DYNAMIC_FILTER_BOTTOM_BETA=10
     CONFIG_INPUT_IQS9151_INIT_PRIORITY=80
 )
+
+if(NOT YUPAD43_TEST_INERTIA_INIT_OFF)
+    target_compile_definitions(app PRIVATE CONFIG_INPUT_IQS9151_SCROLL_INERTIA_ENABLE=1)
+endif()

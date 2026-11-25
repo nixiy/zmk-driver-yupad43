@@ -270,10 +270,11 @@ config INPUT_IQS9151_2F_SCROLL_START_MOVE
       swipes enabled, this also locks the initial horizontal/vertical axis.
 
 config INPUT_IQS9151_SCROLL_INERTIA_ENABLE
-    bool "IQS9151 scroll inertia enable"
+    bool "IQS9151 scroll inertia initially enabled"
     default y
     help
-      Enable scroll inertia (driver-side).
+      Initial runtime setting for driver-side scroll inertia.
+      The public IQS9151 API can enable or disable it even when this is n.
 
 config INPUT_IQS9151_SCROLL_INERTIA_DECAY
     int "IQS9151 scroll inertia decay"

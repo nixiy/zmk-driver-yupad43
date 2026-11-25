@@ -8,6 +8,12 @@ common:
     - native_sim_64
 tests:
   iqs9151.work_cb: {}
+  iqs9151.runtime_inertia:
+    extra_args: YUPAD43_TEST_RUNTIME_INERTIA=ON
+  iqs9151.runtime_inertia.initially_off:
+    extra_args:
+      - YUPAD43_TEST_RUNTIME_INERTIA=ON
+      - YUPAD43_TEST_INERTIA_INIT_OFF=ON
   iqs9151.transport:
     extra_args: YUPAD43_TEST_TRANSPORT=ON
   iqs9151.work_cb.custom_config:

@@ -39,6 +39,7 @@ typedef void (*iqs9151_test_event_hook_t)(const struct iqs9151_test_event *event
 
 #ifdef CONFIG_INPUT_IQS9151_TEST
 size_t iqs9151_test_context_size(void);
+void iqs9151_test_bind_device(struct device *dev, void *ctx);
 void iqs9151_test_context_init(void *ctx, const struct device *dev);
 void iqs9151_test_cancel_pending_work(void *ctx);
 void iqs9151_test_process_frame(void *ctx,
