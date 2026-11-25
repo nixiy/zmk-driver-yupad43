@@ -13,6 +13,7 @@
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/sys/util.h>
 #include <dt-bindings/input/iqs9151.h>
+#include <drivers/input/iqs9151.h>
 
 #include "iqs9151_init.h"
 #include "iqs9151_regs.h"
@@ -213,7 +214,12 @@ struct iqs9151_motion_history {
     uint8_t count;
 };
 
+/* Identity for the device-specific API; there is no generic input vtable. */
+static const uint8_t iqs9151_api_marker;
+
 struct iqs9151_data {
+    struct k_mutex inertia_lock;
+    bool scroll_inertia_enabled;
     const struct device *dev;
     struct gpio_callback gpio_cb;
     struct k_work_q *work_q;
@@ -982,6 +988,59 @@ static bool iqs9151_click_button(struct iqs9151_data *data, const struct device 
     }
     (void)iqs9151_button_up(data, dev, button, K_NO_WAIT);
     return true;
+}
+
+/* Do not wait: an input-thread behavior may call us while the worker reports
+ * input. A nonblocking API avoids inversion with the input queue. */
+static int iqs9151_control_lock(const struct device *dev) {
+    if (dev == NULL || dev->api != &iqs9151_api_marker) {
+        return -EINVAL;
+    }
+    if (k_is_in_isr()) {
+        return -EWOULDBLOCK;
+    }
+    if (!device_is_ready(dev)) {
+        return -ENODEV;
+    }
+    struct iqs9151_data *data = dev->data;
+    /* In synchronous input mode a behavior can reenter us from report_rel.
+     * Refuse control in that context rather than changing a frame mid-flight. */
+    if (k_current_get() == &data->work_q->thread) {
+        return -EBUSY;
+    }
+    return k_mutex_lock(&data->inertia_lock, K_NO_WAIT) == 0 ? 0 : -EBUSY;
+}
+
+int iqs9151_scroll_inertia_set_enabled(const struct device *dev, bool enabled) {
+    int ret = iqs9151_control_lock(dev);
+    if (ret < 0) {
+        return ret;
+    }
+    struct iqs9151_data *data = dev->data;
+    if (!enabled || !data->scroll_inertia_enabled) {
+        iqs9151_inertia_cancel(&data->inertia_scroll, &data->inertia_scroll_work);
+        iqs9151_motion_history_reset(&data->scroll_motion_history);
+        data->scroll_release_expiry_ms = 0;
+        data->scroll_release_vx_fp = 0;
+        data->scroll_release_vy_fp = 0;
+    }
+    data->scroll_inertia_enabled = enabled;
+    k_mutex_unlock(&data->inertia_lock);
+    return 0;
+}
+
+int iqs9151_scroll_inertia_get_enabled(const struct device *dev, bool *enabled) {
+    if (enabled == NULL) {
+        return -EINVAL;
+    }
+    int ret = iqs9151_control_lock(dev);
+    if (ret < 0) {
+        return ret;
+    }
+    struct iqs9151_data *data = dev->data;
+    *enabled = data->scroll_inertia_enabled;
+    k_mutex_unlock(&data->inertia_lock);
+    return 0;
 }
 
 static void iqs9151_release_hold(struct iqs9151_data *data, const struct device *dev) {
@@ -2014,6 +2073,11 @@ static void iqs9151_inertia_scroll_work_cb(struct k_work *work) {
     struct iqs9151_data *data =
         CONTAINER_OF(dwork, struct iqs9151_data, inertia_scroll_work);
     const struct device *dev = data->dev;
+    k_mutex_lock(&data->inertia_lock, K_FOREVER);
+    if (!data->scroll_inertia_enabled) {
+        k_mutex_unlock(&data->inertia_lock);
+        return;
+    }
     int32_t out_x;
     int32_t out_y;
 
@@ -2046,6 +2110,7 @@ static void iqs9151_inertia_scroll_work_cb(struct k_work *work) {
         const int64_t next = data->inertia_scroll.last_ms + iqs9151_scroll_params.interval_ms;
         k_work_schedule_for_queue(data->work_q, &data->inertia_scroll_work, K_MSEC(MAX(1, next - k_uptime_get())));
     }
+    k_mutex_unlock(&data->inertia_lock);
 }
 
 static bool iqs9151_should_suppress_cursor_for_two_finger_tail(
@@ -2167,6 +2232,7 @@ static int iqs9151_read_frame(const struct iqs9151_config *cfg,
 }
 
 static void iqs9151_discard_contacts(struct iqs9151_data *data) {
+    k_mutex_lock(&data->inertia_lock, K_FOREVER);
     iqs9151_reset_gesture_states(data, data->dev, true);
     iqs9151_inertia_cancel(&data->inertia_scroll, &data->inertia_scroll_work);
     iqs9151_inertia_cancel(&data->inertia_cursor, &data->inertia_cursor_work);
@@ -2174,6 +2240,7 @@ static void iqs9151_discard_contacts(struct iqs9151_data *data) {
     iqs9151_motion_history_reset(&data->cursor_motion_history);
     memset(&data->prev_frame, 0, sizeof(data->prev_frame));
     data->have_pending_second = false;
+    k_mutex_unlock(&data->inertia_lock);
 }
 
 static bool iqs9151_handle_show_reset(struct iqs9151_data *data,
@@ -2360,7 +2427,7 @@ static void iqs9151_update_inertia(struct iqs9151_data *data,
     if (two_result->scroll_started || frame->finger_count == 2U || finger1_started) {
         iqs9151_inertia_cancel(&data->inertia_scroll, &data->inertia_scroll_work);
     }
-    if (two_result->scroll_active) {
+    if (data->scroll_inertia_enabled && two_result->scroll_active) {
         if (two_result->scroll_interval_ms > 0U) {
             iqs9151_motion_history_push(&data->scroll_motion_history, two_result->scroll_x,
                                         two_result->scroll_y, now_ms, two_result->scroll_interval_ms);
@@ -2400,7 +2467,7 @@ static void iqs9151_update_inertia(struct iqs9151_data *data,
         int64_t last_motion_ms;
         data->scroll_release_expiry_ms = 0;
         if (frame->finger_count <= 1U &&
-            IS_ENABLED(CONFIG_INPUT_IQS9151_SCROLL_INERTIA_ENABLE) &&
+            data->scroll_inertia_enabled &&
             iqs9151_scroll_seed(data, now_ms, &data->scroll_release_vx_fp,
                                 &data->scroll_release_vy_fp, &last_motion_ms)) {
             data->scroll_release_expiry_ms =
@@ -2524,7 +2591,7 @@ static void iqs9151_dispatch_frame(struct iqs9151_data *data,
     iqs9151_push_finger_history(data, frame->finger_count, now_ms);
 }
 
-static void iqs9151_process_frame(struct iqs9151_data *data,
+static void iqs9151_process_frame_locked(struct iqs9151_data *data,
                                   const struct iqs9151_frame *frame,
                                   int64_t now_ms) {
     /* Calibration quality is advisory for end users. Keep processing valid
@@ -2591,6 +2658,15 @@ static void iqs9151_process_frame(struct iqs9151_data *data,
 
     data->have_pending_second = false;
     iqs9151_dispatch_frame(data, frame, now_ms);
+}
+
+/* Serialize runtime control with complete frames, including pending lifts. */
+static void iqs9151_process_frame(struct iqs9151_data *data,
+                                  const struct iqs9151_frame *frame,
+                                  int64_t now_ms) {
+    k_mutex_lock(&data->inertia_lock, K_FOREVER);
+    iqs9151_process_frame_locked(data, frame, now_ms);
+    k_mutex_unlock(&data->inertia_lock);
 }
 
 static int iqs9151_set_interrupt(const struct device *dev, bool enable);
@@ -3067,6 +3143,8 @@ static int iqs9151_init(const struct device *dev) {
     data->dev = dev;
 
     LOG_DBG("Initialization Start");
+    k_mutex_init(&data->inertia_lock);
+    data->scroll_inertia_enabled = IS_ENABLED(CONFIG_INPUT_IQS9151_SCROLL_INERTIA_ENABLE);
 
     if (!device_is_ready(cfg->i2c.bus)) {
         LOG_ERR("I2C bus not ready");
@@ -3167,10 +3245,18 @@ size_t iqs9151_test_context_size(void) {
     return sizeof(struct iqs9151_data);
 }
 
+void iqs9151_test_bind_device(struct device *dev, void *ctx) {
+    static struct device_state ready = {.initialized = true};
+    *dev = (struct device){.name = "iqs9151_test", .data = ctx,
+                           .state = &ready, .api = &iqs9151_api_marker};
+}
+
 void iqs9151_test_context_init(void *ctx, const struct device *dev) {
     struct iqs9151_data *data = (struct iqs9151_data *)ctx;
 
     memset(data, 0, sizeof(*data));
+    k_mutex_init(&data->inertia_lock);
+    data->scroll_inertia_enabled = IS_ENABLED(CONFIG_INPUT_IQS9151_SCROLL_INERTIA_ENABLE);
     data->dev = dev;
     data->work_q = &test_worker.queue;
     k_work_init_delayable(&data->frame_work, iqs9151_work_cb);
@@ -3303,6 +3389,6 @@ void iqs9151_test_force_pinch_session(void *ctx, bool active) {
     static struct iqs9151_data iqs9151_data_##inst;                             \
     DEVICE_DT_INST_DEFINE(inst, iqs9151_init, NULL, &iqs9151_data_##inst,       \
                           &iqs9151_config_##inst, POST_KERNEL,                  \
-                          CONFIG_INPUT_IQS9151_INIT_PRIORITY, NULL);
+                          CONFIG_INPUT_IQS9151_INIT_PRIORITY, &iqs9151_api_marker);
 
 DT_INST_FOREACH_STATUS_OKAY(IQS9151_INIT);

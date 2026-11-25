@@ -6,6 +6,7 @@
 #include <zephyr/input/input.h>
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/ztest.h>
+#include <drivers/input/iqs9151.h>
 #include <string.h>
 
 #include "iqs9151_regs.h"
@@ -245,6 +246,16 @@ ZTEST(iqs9151_transport, test_irq_error_and_already_asserted_pin) {
 ZTEST(iqs9151_transport, test_io_retry_and_runtime_reconfiguration) {
     struct sensor *s = EMUL_DT_GET(DT_NODELABEL(test_pad))->data;
     wait_for_count(&s->initial_frame, 1, 300);
+    const struct device *pad = DEVICE_DT_GET(DT_NODELABEL(test_pad));
+    int ret;
+    for (int attempt = 0; attempt < 100; attempt++) {
+        ret = iqs9151_scroll_inertia_set_enabled(pad, false);
+        if (ret != -EBUSY) {
+            break;
+        }
+        k_msleep(1);
+    }
+    zassert_ok(ret);
     int frames = atomic_get(&s->frame_reads);
     atomic_set(&s->nack_frames, 1);
     signal_window(s);
@@ -295,6 +306,9 @@ ZTEST(iqs9151_transport, test_io_retry_and_runtime_reconfiguration) {
     wait_for_count(&s->calibrations, atis + 1, 900);
     k_msleep(20);
     zassert_mem_equal(at(s, config_base), original, sizeof(original));
+    bool enabled = true;
+    zassert_ok(iqs9151_scroll_inertia_get_enabled(pad, &enabled));
+    zassert_false(enabled, "Sensor reinitialization must preserve runtime setting");
     /* ATI quality warning after recovery must permit ordinary cursor motion. */
     sys_put_le16(IQS9151_INFO_ATI_ERROR, at(s, IQS9151_ADDR_INFO_FLAGS));
     sys_put_le16(IQS9151_TP_FINGER1_CONFIDENCE | IQS9151_TP_MOVEMENT_DETECTED | 1,

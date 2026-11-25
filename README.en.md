@@ -66,6 +66,16 @@ Use a pristine build or an explicit 2048-byte `.conf` setting if an old build
 cache retains the previous 512-byte value.
 The 520-byte figure is a static lower bound, not measured peak usage on hardware.
 
+## Runtime scroll inertia control
+
+Firmware can set/get per-device scroll inertia through `<drivers/input/iqs9151.h>`.
+`CONFIG_INPUT_IQS9151_SCROLL_INERTIA_ENABLE` is the initial value; runtime enabling
+also works when it is `n`. Disabling clears the active glide and stored velocity.
+The APIs are thread-only and may return `-EBUSY`; defer/retry without treating it
+as success. Retained-RAM sleep and sensor recovery preserve the setting; MCU
+reboot restores the initial value. Already queued input/HID events cannot be recalled.
+See [API and verification details (Japanese)](docs/runtime-scroll-inertia.md).
+
 ## License
 
 Based on ShiniNet / zmk-driver-iqs9151 (MIT License), with changes to the electrode configuration, initialization settings, and ATI communication for yuPad43.

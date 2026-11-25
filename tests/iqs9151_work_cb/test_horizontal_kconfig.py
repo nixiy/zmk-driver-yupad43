@@ -25,6 +25,14 @@ def main():
         choice = config.named_choices["INPUT_IQS9151_2F_HORIZONTAL_MODE"]
         assert choice.selection is modes[0], "Default must remain horizontal scrolling"
         assert config.syms["INPUT_IQS9151_2F_HORIZONTAL_SWIPE_THRESHOLD"].str_value == "200"
+        inertia = config.syms["INPUT_IQS9151_SCROLL_INERTIA_ENABLE"]
+        assert inertia.str_value == "y", "Existing initial value must be preserved"
+        inertia.set_value("n")
+        assert inertia.str_value == "n"
+        assert config.syms["INPUT_IQS9151_SCROLL_INERTIA_DECAY"].str_value == "940", (
+            "Runtime enabling still requires inertia parameters when initially off"
+        )
+        inertia.set_value("y")
         for selected in modes[1:] + modes[:1]:
             selected.set_value("y")
             assert choice.selection is selected

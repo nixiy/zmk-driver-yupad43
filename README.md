@@ -63,6 +63,12 @@ sync は true です。コードはドライバー専用で、HIDコードやマ
 既存のビルドキャッシュに512が残る場合は、pristineビルドまたは`.conf`で2048を明示してください。
 これは処理経路の静的検証による下限で、実機の最大使用量の測定値ではありません。
 
+## 慣性スクロールの実行時切り替え
+
+FWからデバイスを指定して慣性スクロールをON/OFFできます。起動時の初期値は
+`CONFIG_INPUT_IQS9151_SCROLL_INERTIA_ENABLE` で指定し、`n` でも実行時にONにできます。
+公開API、エラー、復帰時の動作、確認項目は[実行時切り替えの説明](docs/runtime-scroll-inertia.md)を参照してください。
+
 ## ライセンス
 
 ShiniNet / zmk-driver-iqs9151（MIT License）を基に、yuPad43向けの電極設定・初期化設定・ATI通信処理を変更しています。
